@@ -30,7 +30,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /build/target/release/ci-tracer /usr/local/bin/ci-tracer
 COPY entrypoint.sh /entrypoint.sh
 COPY start-ci-tracer.sh /usr/local/bin/start-ci-tracer
-RUN sed -i 's/\r$//' /entrypoint.sh /usr/local/bin/start-ci-tracer \
-    && chmod +x /entrypoint.sh /usr/local/bin/start-ci-tracer
+COPY sh-wrapper.sh /usr/local/bin/sh-wrapper.sh
+
+# Fix CRLF, set permissions, install sh wrapper.
+# The wrapper intercepts `docker exec sh -c "..."` calls from GitHub Actions
+# and auto-starts the tracer on first invocation.
+RUN sed -i 's/\r$//' /entrypoint.sh /usr/local/bin/start-ci-tracer /usr/local/bin/sh-wrapper.sh \
+    && chmod +x /entrypoint.sh /usr/local/bin/start-ci-tracer /usr/local/bin/sh-wrapper.sh \
+    && cp /usr/bin/dash /usr/bin/sh.real \
+    && cp /usr/local/bin/sh-wrapper.sh /usr/bin/sh
 
 ENTRYPOINT ["/entrypoint.sh"]
