@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
         tokio::select! {
             _ = sigterm.recv() => break,
             _ = tokio::signal::ctrl_c() => break,
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
         }
     }
 
