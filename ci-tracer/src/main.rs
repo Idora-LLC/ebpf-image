@@ -132,8 +132,13 @@ async fn main() -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
 
     loop {
+        let mut had_events = false;
         while let Some(item) = ring_buf.next() {
             handle_event(&item, &mut writer, &mut tree, &mut stats);
+            had_events = true;
+        }
+        if had_events {
+            let _ = writer.flush();
         }
 
         tokio::select! {
