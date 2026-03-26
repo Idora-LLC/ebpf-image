@@ -1,0 +1,13 @@
+[package]
+name = "ci-tracer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya = "0.13"
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt", "signal", "time"] }
+serde_json = "1"
+chrono = "0.4"
+libc = "0.2"
+ci-tracer-common = { path = "../ci-tracer-common" }

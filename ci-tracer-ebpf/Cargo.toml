@@ -1,0 +1,25 @@
+[package]
+name = "ci-tracer-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ci-tracer-ebpf"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.1.1"
+ci-tracer-common = { path = "../ci-tracer-common" }
+
+[profile.dev]
+opt-level = 2
+overflow-checks = false
+
+[profile.release]
+lto = true
+panic = "abort"
+codegen-units = 1
+opt-level = 2
+strip = "none"
+debug = 2
+overflow-checks = false

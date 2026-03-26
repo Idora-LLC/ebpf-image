@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["ci-tracer", "ci-tracer-common", "xtask"]
