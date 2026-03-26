@@ -21,6 +21,10 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
 #[map]
 static START_TIMES: LruHashMap<u32, u64> = LruHashMap::with_max_entries(10240, 0);
 
+/// Tracks child → parent PID relationships (populated by fork handler).
+#[map]
+static PARENT_MAP: LruHashMap<u32, u32> = LruHashMap::with_max_entries(10240, 0);
+
 /// Per-CPU scratch buffer for exec events (avoids 512-byte BPF stack limit).
 #[map]
 static EXEC_BUF: PerCpuArray<ProcessExecEvent> = PerCpuArray::with_max_entries(1, 0);
@@ -28,6 +32,30 @@ static EXEC_BUF: PerCpuArray<ProcessExecEvent> = PerCpuArray::with_max_entries(1
 /// Per-CPU scratch buffer for file-open events.
 #[map]
 static FILE_BUF: PerCpuArray<FileOpenEvent> = PerCpuArray::with_max_entries(1, 0);
+
+// ---------------------------------------------------------------------------
+// sched_process_fork – records parent→child PID mapping
+// ---------------------------------------------------------------------------
+// Tracepoint format (x86_64):
+//   offset  8: char parent_comm[16]
+//   offset 24: pid_t parent_pid     (i32)
+//   offset 28: char child_comm[16]
+//   offset 44: pid_t child_pid      (i32)
+
+#[tracepoint]
+pub fn trace_fork(ctx: TracePointContext) -> u32 {
+    match unsafe { try_trace_fork(&ctx) } {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+unsafe fn try_trace_fork(ctx: &TracePointContext) -> Result<(), i64> {
+    let parent_pid: u32 = ctx.read_at::<i32>(24).map(|v| v as u32)?;
+    let child_pid: u32 = ctx.read_at::<i32>(44).map(|v| v as u32)?;
+    let _ = PARENT_MAP.insert(&child_pid, &parent_pid, 0);
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // sched_process_exec – fires when a process calls execve()
@@ -57,13 +85,20 @@ unsafe fn try_trace_exec(ctx: &TracePointContext) -> Result<(), i64> {
 
     let uid = bpf_get_current_uid_gid() as u32;
 
+    let ppid = match PARENT_MAP.get(&pid) {
+        Some(p) => *p,
+        None => 0,
+    };
+
     let _ = START_TIMES.insert(&pid, &ts, 0);
 
     let buf = &mut *EXEC_BUF.get_ptr_mut(0).ok_or(0i64)?;
     buf.event_type = EVENT_PROCESS_EXEC;
     buf.pid = pid;
+    buf.ppid = ppid;
     buf.tgid = tgid;
     buf.uid = uid;
+    buf._pad = 0;
     buf.timestamp_ns = ts;
     buf.comm = bpf_get_current_comm().map_err(|e| e)?;
 

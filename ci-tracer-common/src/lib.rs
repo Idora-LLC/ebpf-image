@@ -12,8 +12,10 @@ pub const PATH_LEN: usize = 256;
 pub struct ProcessExecEvent {
     pub event_type: u32,
     pub pid: u32,
+    pub ppid: u32,
     pub tgid: u32,
     pub uid: u32,
+    pub _pad: u32,
     pub timestamp_ns: u64,
     pub comm: [u8; COMM_LEN],
     pub filename: [u8; PATH_LEN],

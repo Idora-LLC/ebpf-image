@@ -13,9 +13,8 @@ use tokio::signal::unix::{signal, SignalKind};
 
 use ci_tracer_common::*;
 
-/// Commands we want to trace. When a process whose cmdline matches one of
-/// these patterns is exec'd, it becomes a "root" and all its descendants
-/// (children, grandchildren, ...) are tracked.
+/// Commands we want to trace. Matched against the 16-byte `comm` field
+/// which npm sets via process.title (e.g. "npm run build").
 const WHITELIST: &[&str] = &["npm run build", "npm run test"];
 
 /// Info about a tracked process: which whitelisted root it belongs to.
@@ -25,83 +24,72 @@ struct TrackedRoot {
     root_cmd: String,
 }
 
-/// Process tree tracker. Maps PID → root info for all tracked processes.
 struct ProcessTree {
+    /// PID → root info for all tracked processes.
     tracked: HashMap<u32, TrackedRoot>,
+    /// PID → ppid from BPF fork events (for all processes, not just tracked).
+    parents: HashMap<u32, u32>,
 }
 
 impl ProcessTree {
     fn new() -> Self {
         Self {
             tracked: HashMap::new(),
+            parents: HashMap::new(),
         }
     }
 
-    /// Check if this newly exec'd process should be tracked.
-    /// Returns the root info if yes.
-    fn check_exec(&mut self, pid: u32, comm: &str) -> Option<TrackedRoot> {
-        // Read the full cmdline from /proc to match against whitelist.
-        let cmdline = read_cmdline(pid).unwrap_or_default();
+    /// Record a parent→child relationship from BPF (called for every exec).
+    fn set_parent(&mut self, pid: u32, ppid: u32) {
+        if ppid != 0 {
+            self.parents.insert(pid, ppid);
+        }
+    }
 
-        // Check if this process itself matches the whitelist.
+    /// Check if a process matches the whitelist or inherits from a tracked parent.
+    fn check_membership(&mut self, pid: u32, comm: &str) -> Option<TrackedRoot> {
+        if let Some(root) = self.tracked.get(&pid) {
+            return Some(root.clone());
+        }
+
+        // Check comm against whitelist.
         for pattern in WHITELIST {
-            if cmdline.contains(pattern) || comm_matches(comm, pattern) {
+            if comm_matches(comm, pattern) {
                 let root = TrackedRoot {
                     root_pid: pid,
-                    root_cmd: cmdline.clone(),
+                    root_cmd: comm.to_string(),
                 };
                 self.tracked.insert(pid, root.clone());
                 return Some(root);
             }
         }
 
-        // Check if the parent is tracked (inherit the root).
-        let ppid = read_ppid(pid).unwrap_or(0);
-        if let Some(root) = self.tracked.get(&ppid).cloned() {
-            self.tracked.insert(pid, root.clone());
-            return Some(root);
+        // Walk up the parent chain looking for a tracked ancestor.
+        let mut cursor = pid;
+        for _ in 0..32 {
+            let ppid = match self.parents.get(&cursor) {
+                Some(&p) => p,
+                None => break,
+            };
+            if let Some(root) = self.tracked.get(&ppid).cloned() {
+                self.tracked.insert(pid, root.clone());
+                return Some(root);
+            }
+            cursor = ppid;
         }
 
         None
     }
 
-    /// Check if a PID is tracked (for file/exit events).
-    fn get(&self, pid: &u32) -> Option<&TrackedRoot> {
-        self.tracked.get(pid)
-    }
-
-    /// Remove a PID on exit, return its root info.
+    /// Remove a PID on exit.
     fn remove(&mut self, pid: &u32) -> Option<TrackedRoot> {
+        self.parents.remove(pid);
         self.tracked.remove(pid)
     }
 }
 
-/// Read /proc/<pid>/cmdline and return as a space-separated string.
-fn read_cmdline(pid: u32) -> Option<String> {
-    let data = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let s: String = data
-        .split(|&b| b == 0)
-        .filter(|p| !p.is_empty())
-        .map(|p| String::from_utf8_lossy(p).into_owned())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if s.is_empty() { None } else { Some(s) }
-}
-
-/// Read ppid from /proc/<pid>/stat.
-fn read_ppid(pid: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // Format: "pid (comm) state ppid ..."
-    // Find the closing ')' then parse the 4th field.
-    let after_comm = stat.rfind(')')? + 2;
-    let fields: Vec<&str> = stat[after_comm..].split_whitespace().collect();
-    // fields[0] = state, fields[1] = ppid
-    fields.get(1)?.parse().ok()
-}
-
-/// Check if the 16-byte comm field (e.g. "npm run build") matches a pattern.
+/// Match the kernel's 16-byte comm field against a whitelist pattern.
 fn comm_matches(comm: &str, pattern: &str) -> bool {
-    // comm is truncated to 16 chars by the kernel
     if pattern.len() <= COMM_LEN {
         comm == pattern
     } else {
@@ -123,6 +111,7 @@ async fn main() -> Result<()> {
 
     let mut bpf = Ebpf::load(&BPF_OBJ.0)?;
 
+    attach_tracepoint(&mut bpf, "trace_fork", "sched", "sched_process_fork")?;
     attach_tracepoint(&mut bpf, "trace_exec", "sched", "sched_process_exec")?;
     attach_tracepoint(&mut bpf, "trace_exit", "sched", "sched_process_exit")?;
     attach_tracepoint(&mut bpf, "trace_openat", "syscalls", "sys_enter_openat")?;
@@ -225,7 +214,9 @@ fn handle_exec(
     let comm = bytes_to_str(&event.comm);
     let filename = bytes_to_str(&event.filename);
 
-    let Some(root) = tree.check_exec(event.pid, comm) else {
+    tree.set_parent(event.pid, event.ppid);
+
+    let Some(root) = tree.check_membership(event.pid, comm) else {
         return;
     };
 
@@ -236,6 +227,7 @@ fn handle_exec(
         "ts": now,
         "event": "exec",
         "pid": event.pid,
+        "ppid": event.ppid,
         "comm": comm,
         "filename": filename,
         "root_pid": root.root_pid,
@@ -244,8 +236,8 @@ fn handle_exec(
     let _ = writeln!(writer, "{j}");
 
     eprintln!(
-        "[ci-recorder] EXEC  pid={:<6} {:<16} {} (root: {})",
-        event.pid, comm, filename, root.root_cmd
+        "[ci-recorder] EXEC  pid={:<6} ppid={:<6} {:<16} {} (root: {})",
+        event.pid, event.ppid, comm, filename, root.root_cmd
     );
 }
 
@@ -259,12 +251,15 @@ fn handle_exit(
         return;
     }
     let event: &ProcessExitEvent = unsafe { &*(data.as_ptr() as *const ProcessExitEvent) };
+    let comm = bytes_to_str(&event.comm);
+
+    // Check comm in case we haven't seen the exec (npm sets title later).
+    let _ = tree.check_membership(event.pid, comm);
 
     let Some(root) = tree.remove(&event.pid) else {
         return;
     };
 
-    let comm = bytes_to_str(&event.comm);
     let duration_s = event.duration_ns as f64 / 1_000_000_000.0;
 
     let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -295,13 +290,14 @@ fn handle_file_open(
         return;
     }
     let event: &FileOpenEvent = unsafe { &*(data.as_ptr() as *const FileOpenEvent) };
-
-    let Some(root) = tree.get(&event.pid) else {
-        return;
-    };
-
     let comm = bytes_to_str(&event.comm);
     let filename = bytes_to_str(&event.filename);
+
+    // Check comm — npm sets process.title to "npm run build" AFTER exec,
+    // so the first match often comes from a file-open event.
+    let Some(root) = tree.check_membership(event.pid, comm) else {
+        return;
+    };
 
     if is_skip_path(filename) {
         return;
@@ -351,7 +347,6 @@ fn classify_access(flags: u32) -> &'static str {
     }
 }
 
-/// Drop entirely -- not relevant for CI tracing.
 fn is_skip_path(path: &str) -> bool {
     !path.starts_with('/')
         || path.starts_with("/proc/")
