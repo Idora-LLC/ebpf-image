@@ -27,8 +27,10 @@ async function run() {
     try { execSync('sudo mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true'); } catch {}
     try { execSync('sudo mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true'); } catch {}
 
-    // Start the tracer in the background via sudo (needs root for eBPF)
-    execSync(`sudo sh -c 'nohup ${BINARY} > ${LOG_FILE} 2>&1 & echo $! > ${PID_FILE}'`);
+    // Start the tracer in the background via sudo (needs root for eBPF).
+    // Pass GITHUB_WORKSPACE so the tracer filters to project files only.
+    const ws = process.env.GITHUB_WORKSPACE || '';
+    execSync(`sudo GITHUB_WORKSPACE="${ws}" sh -c 'nohup ${BINARY} > ${LOG_FILE} 2>&1 & echo $! > ${PID_FILE}'`);
     const pid = fs.readFileSync(PID_FILE, 'utf8').trim();
 
     console.log(`[ci-recorder] Tracer started (PID ${pid})`);
