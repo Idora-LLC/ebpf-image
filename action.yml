@@ -1,0 +1,24 @@
+name: 'CI Recorder'
+description: 'eBPF-based CI tracer that records process executions and file I/O during your pipeline'
+author: 'Idora LLC'
+
+inputs:
+  whitelist:
+    description: 'Comma-separated list of commands to trace (matched against process comm field)'
+    required: false
+    default: 'npm run build,npm run test'
+  upload-artifact:
+    description: 'Automatically upload the trace as an artifact'
+    required: false
+    default: 'true'
+  artifact-name:
+    description: 'Name of the uploaded artifact'
+    required: false
+    default: 'ci-trace'
+
+runs:
+  using: 'node20'
+  pre: 'action/start.js'
+  main: 'action/noop.js'
+  post: 'action/stop.js'
+  post-if: 'always()'
