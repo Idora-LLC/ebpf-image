@@ -38,6 +38,7 @@ COPY sh-wrapper.sh /usr/local/bin/sh-wrapper.sh
 RUN sed -i 's/\r$//' /entrypoint.sh /usr/local/bin/start-ci-tracer /usr/local/bin/sh-wrapper.sh \
     && chmod +x /entrypoint.sh /usr/local/bin/start-ci-tracer /usr/local/bin/sh-wrapper.sh \
     && cp /usr/bin/dash /usr/bin/sh.real \
+    && rm /usr/bin/sh \
     && cp /usr/local/bin/sh-wrapper.sh /usr/bin/sh
 
 ENTRYPOINT ["/entrypoint.sh"]
