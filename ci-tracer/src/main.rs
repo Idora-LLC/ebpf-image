@@ -14,6 +14,9 @@ use ci_tracer_common::*;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    // Ignore SIGPIPE so writing to stderr after the launching docker exec
+    // exits doesn't kill us.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN); }
     bump_memlock_rlimit();
 
     #[repr(C, align(8))]
