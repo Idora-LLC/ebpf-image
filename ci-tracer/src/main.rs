@@ -1,5 +1,6 @@
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
+use std::os::unix::fs::MetadataExt;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -24,6 +25,19 @@ async fn main() -> Result<()> {
     attach_tracepoint(&mut bpf, "trace_exec", "sched", "sched_process_exec")?;
     attach_tracepoint(&mut bpf, "trace_exit", "sched", "sched_process_exit")?;
     attach_tracepoint(&mut bpf, "trace_openat", "syscalls", "sys_enter_openat")?;
+
+    // Scope tracing to this container's cgroup so we ignore host processes.
+    {
+        let cgroup_id = get_own_cgroup_id().unwrap_or(0);
+        let mut arr: aya::maps::Array<_, u64> =
+            aya::maps::Array::try_from(bpf.map_mut("TARGET_CGROUPID").unwrap())?;
+        arr.set(0, cgroup_id, 0)?;
+        if cgroup_id > 0 {
+            eprintln!("[ci-recorder] Filtering to container cgroup {cgroup_id}");
+        } else {
+            eprintln!("[ci-recorder] WARNING: could not detect cgroup, tracing everything");
+        }
+    }
 
     eprintln!("[ci-recorder] Tracer started, attaching eBPF probes...");
 
@@ -62,6 +76,28 @@ async fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Read our own cgroup v2 ID so the BPF program can filter by it.
+fn get_own_cgroup_id() -> Result<u64> {
+    let content = std::fs::read_to_string("/proc/self/cgroup")
+        .context("failed to read /proc/self/cgroup")?;
+
+    for line in content.lines() {
+        if let Some(path) = line.strip_prefix("0::") {
+            let path = path.trim();
+            let full = if path.is_empty() || path == "/" {
+                "/sys/fs/cgroup".to_string()
+            } else {
+                format!("/sys/fs/cgroup{path}")
+            };
+            let meta = std::fs::metadata(&full)
+                .with_context(|| format!("failed to stat {full}"))?;
+            return Ok(meta.ino());
+        }
+    }
+
+    anyhow::bail!("no cgroup v2 entry in /proc/self/cgroup")
 }
 
 fn attach_tracepoint(
@@ -224,12 +260,10 @@ fn classify_access(flags: u32) -> &'static str {
 }
 
 fn is_noise_path(path: &str) -> bool {
-    path.starts_with("/proc/")
+    !path.starts_with('/')
+        || path.starts_with("/proc/")
         || path.starts_with("/sys/")
         || path.starts_with("/dev/")
-        || path.starts_with("/etc/ld.so")
-        || path.contains(".so.")
-        || path.ends_with(".so")
 }
 
 fn bump_memlock_rlimit() {
