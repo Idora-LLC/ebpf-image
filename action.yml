@@ -3,6 +3,10 @@ description: 'eBPF-based CI tracer that records process executions and file I/O 
 author: 'Idora LLC'
 
 inputs:
+  token:
+    description: 'GitHub token for pulling the tracer image from GHCR'
+    required: false
+    default: ${{ github.token }}
   whitelist:
     description: 'Comma-separated list of commands to trace (matched against process comm field)'
     required: false

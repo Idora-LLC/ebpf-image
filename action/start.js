@@ -11,11 +11,15 @@ async function run() {
     // Extract the pre-built binary from the published Docker image.
     if (!fs.existsSync(BINARY)) {
       console.log('[ci-recorder] Downloading tracer binary...');
+      const token = process.env.INPUT_TOKEN || '';
+      if (token) {
+        execSync(`echo "${token}" | docker login ghcr.io -u github --password-stdin`, { stdio: 'ignore' });
+      }
       execSync(`docker pull ${IMAGE}`, { stdio: 'inherit' });
       const cid = execSync(`docker create ${IMAGE}`).toString().trim();
-      execSync(`docker cp ${cid}:${BINARY} ${BINARY}`);
+      execSync(`sudo docker cp ${cid}:${BINARY} ${BINARY}`, { stdio: 'inherit' });
       execSync(`docker rm ${cid}`, { stdio: 'ignore' });
-      fs.chmodSync(BINARY, 0o755);
+      execSync(`sudo chmod 755 ${BINARY}`);
       console.log('[ci-recorder] Binary installed');
     }
 
