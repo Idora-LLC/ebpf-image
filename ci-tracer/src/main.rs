@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::time::Duration;
@@ -12,10 +13,104 @@ use tokio::signal::unix::{signal, SignalKind};
 
 use ci_tracer_common::*;
 
+/// Commands we want to trace. When a process whose cmdline matches one of
+/// these patterns is exec'd, it becomes a "root" and all its descendants
+/// (children, grandchildren, ...) are tracked.
+const WHITELIST: &[&str] = &["npm run build", "npm run test"];
+
+/// Info about a tracked process: which whitelisted root it belongs to.
+#[derive(Clone)]
+struct TrackedRoot {
+    root_pid: u32,
+    root_cmd: String,
+}
+
+/// Process tree tracker. Maps PID → root info for all tracked processes.
+struct ProcessTree {
+    tracked: HashMap<u32, TrackedRoot>,
+}
+
+impl ProcessTree {
+    fn new() -> Self {
+        Self {
+            tracked: HashMap::new(),
+        }
+    }
+
+    /// Check if this newly exec'd process should be tracked.
+    /// Returns the root info if yes.
+    fn check_exec(&mut self, pid: u32, comm: &str) -> Option<TrackedRoot> {
+        // Read the full cmdline from /proc to match against whitelist.
+        let cmdline = read_cmdline(pid).unwrap_or_default();
+
+        // Check if this process itself matches the whitelist.
+        for pattern in WHITELIST {
+            if cmdline.contains(pattern) || comm_matches(comm, pattern) {
+                let root = TrackedRoot {
+                    root_pid: pid,
+                    root_cmd: cmdline.clone(),
+                };
+                self.tracked.insert(pid, root.clone());
+                return Some(root);
+            }
+        }
+
+        // Check if the parent is tracked (inherit the root).
+        let ppid = read_ppid(pid).unwrap_or(0);
+        if let Some(root) = self.tracked.get(&ppid).cloned() {
+            self.tracked.insert(pid, root.clone());
+            return Some(root);
+        }
+
+        None
+    }
+
+    /// Check if a PID is tracked (for file/exit events).
+    fn get(&self, pid: &u32) -> Option<&TrackedRoot> {
+        self.tracked.get(pid)
+    }
+
+    /// Remove a PID on exit, return its root info.
+    fn remove(&mut self, pid: &u32) -> Option<TrackedRoot> {
+        self.tracked.remove(pid)
+    }
+}
+
+/// Read /proc/<pid>/cmdline and return as a space-separated string.
+fn read_cmdline(pid: u32) -> Option<String> {
+    let data = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let s: String = data
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Read ppid from /proc/<pid>/stat.
+fn read_ppid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Format: "pid (comm) state ppid ..."
+    // Find the closing ')' then parse the 4th field.
+    let after_comm = stat.rfind(')')? + 2;
+    let fields: Vec<&str> = stat[after_comm..].split_whitespace().collect();
+    // fields[0] = state, fields[1] = ppid
+    fields.get(1)?.parse().ok()
+}
+
+/// Check if the 16-byte comm field (e.g. "npm run build") matches a pattern.
+fn comm_matches(comm: &str, pattern: &str) -> bool {
+    // comm is truncated to 16 chars by the kernel
+    if pattern.len() <= COMM_LEN {
+        comm == pattern
+    } else {
+        comm == &pattern[..COMM_LEN]
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    // Ignore SIGPIPE so writing to stderr after the launching docker exec
-    // exits doesn't kill us.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN); }
     bump_memlock_rlimit();
 
@@ -32,7 +127,7 @@ async fn main() -> Result<()> {
     attach_tracepoint(&mut bpf, "trace_exit", "sched", "sched_process_exit")?;
     attach_tracepoint(&mut bpf, "trace_openat", "syscalls", "sys_enter_openat")?;
 
-    eprintln!("[ci-recorder] Tracer started, attaching eBPF probes...");
+    eprintln!("[ci-recorder] Tracer started, watching for: {:?}", WHITELIST);
 
     let mut ring_buf = RingBuf::try_from(bpf.map_mut("EVENTS").unwrap())?;
 
@@ -43,12 +138,13 @@ async fn main() -> Result<()> {
         .context("failed to open /var/log/ci-trace.jsonl")?;
     let mut writer = BufWriter::new(file);
 
+    let mut tree = ProcessTree::new();
     let mut stats = Stats::default();
     let mut sigterm = signal(SignalKind::terminate())?;
 
     loop {
         while let Some(item) = ring_buf.next() {
-            handle_event(&item, &mut writer, &mut stats);
+            handle_event(&item, &mut writer, &mut tree, &mut stats);
         }
 
         tokio::select! {
@@ -59,7 +155,7 @@ async fn main() -> Result<()> {
     }
 
     while let Some(item) = ring_buf.next() {
-        handle_event(&item, &mut writer, &mut stats);
+        handle_event(&item, &mut writer, &mut tree, &mut stats);
     }
     let _ = writer.flush();
 
@@ -96,23 +192,32 @@ struct Stats {
     files_written: u64,
 }
 
-fn handle_event(data: &[u8], writer: &mut BufWriter<std::fs::File>, stats: &mut Stats) {
+fn handle_event(
+    data: &[u8],
+    writer: &mut BufWriter<std::fs::File>,
+    tree: &mut ProcessTree,
+    stats: &mut Stats,
+) {
     if data.len() < 4 {
         return;
     }
 
     let event_type = u32::from_ne_bytes(data[0..4].try_into().unwrap());
-    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     match event_type {
-        EVENT_PROCESS_EXEC => handle_exec(data, &now, writer, stats),
-        EVENT_PROCESS_EXIT => handle_exit(data, &now, writer, stats),
-        EVENT_FILE_OPEN => handle_file_open(data, &now, writer, stats),
+        EVENT_PROCESS_EXEC => handle_exec(data, writer, tree, stats),
+        EVENT_PROCESS_EXIT => handle_exit(data, writer, tree, stats),
+        EVENT_FILE_OPEN => handle_file_open(data, writer, tree, stats),
         _ => {}
     }
 }
 
-fn handle_exec(data: &[u8], now: &str, writer: &mut BufWriter<std::fs::File>, stats: &mut Stats) {
+fn handle_exec(
+    data: &[u8],
+    writer: &mut BufWriter<std::fs::File>,
+    tree: &mut ProcessTree,
+    stats: &mut Stats,
+) {
     if data.len() < std::mem::size_of::<ProcessExecEvent>() {
         return;
     }
@@ -120,58 +225,81 @@ fn handle_exec(data: &[u8], now: &str, writer: &mut BufWriter<std::fs::File>, st
     let comm = bytes_to_str(&event.comm);
     let filename = bytes_to_str(&event.filename);
 
+    let Some(root) = tree.check_exec(event.pid, comm) else {
+        return;
+    };
+
     stats.process_count += 1;
 
-    eprintln!(
-        "[ci-recorder] EXEC  pid={:<6} {:<16} {}",
-        event.pid, comm, filename
-    );
-
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let j = json!({
         "ts": now,
         "event": "exec",
         "pid": event.pid,
-        "tgid": event.tgid,
-        "uid": event.uid,
         "comm": comm,
         "filename": filename,
+        "root_pid": root.root_pid,
+        "root_cmd": root.root_cmd,
     });
     let _ = writeln!(writer, "{j}");
+
+    eprintln!(
+        "[ci-recorder] EXEC  pid={:<6} {:<16} {} (root: {})",
+        event.pid, comm, filename, root.root_cmd
+    );
 }
 
-fn handle_exit(data: &[u8], now: &str, writer: &mut BufWriter<std::fs::File>, stats: &mut Stats) {
+fn handle_exit(
+    data: &[u8],
+    writer: &mut BufWriter<std::fs::File>,
+    tree: &mut ProcessTree,
+    stats: &mut Stats,
+) {
     if data.len() < std::mem::size_of::<ProcessExitEvent>() {
         return;
     }
     let event: &ProcessExitEvent = unsafe { &*(data.as_ptr() as *const ProcessExitEvent) };
+
+    let Some(root) = tree.remove(&event.pid) else {
+        return;
+    };
+
     let comm = bytes_to_str(&event.comm);
     let duration_s = event.duration_ns as f64 / 1_000_000_000.0;
 
-    eprintln!(
-        "[ci-recorder] EXIT  pid={:<6} {:<16} duration={:.3}s",
-        event.pid, comm, duration_s
-    );
-
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let j = json!({
         "ts": now,
         "event": "exit",
         "pid": event.pid,
         "comm": comm,
         "duration_ms": event.duration_ns / 1_000_000,
+        "root_pid": root.root_pid,
+        "root_cmd": root.root_cmd,
     });
     let _ = writeln!(writer, "{j}");
+
+    eprintln!(
+        "[ci-recorder] EXIT  pid={:<6} {:<16} duration={:.3}s (root: {})",
+        event.pid, comm, duration_s, root.root_cmd
+    );
 }
 
 fn handle_file_open(
     data: &[u8],
-    now: &str,
     writer: &mut BufWriter<std::fs::File>,
+    tree: &mut ProcessTree,
     stats: &mut Stats,
 ) {
     if data.len() < std::mem::size_of::<FileOpenEvent>() {
         return;
     }
     let event: &FileOpenEvent = unsafe { &*(data.as_ptr() as *const FileOpenEvent) };
+
+    let Some(root) = tree.get(&event.pid) else {
+        return;
+    };
+
     let comm = bytes_to_str(&event.comm);
     let filename = bytes_to_str(&event.filename);
 
@@ -186,6 +314,9 @@ fn handle_file_open(
         _ => stats.files_written += 1,
     }
 
+    let root = root.clone();
+
+    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let j = json!({
         "ts": now,
         "event": "open",
@@ -193,21 +324,10 @@ fn handle_file_open(
         "comm": comm,
         "path": filename,
         "access": access,
+        "root_pid": root.root_pid,
+        "root_cmd": root.root_cmd,
     });
     let _ = writeln!(writer, "{j}");
-
-    if !is_infra_path(filename) {
-        let label = match access {
-            "read" => "READ ",
-            "write" => "WRITE",
-            "create" => "CREAT",
-            _ => "FILE ",
-        };
-        eprintln!(
-            "[ci-recorder] {label}  pid={:<6} {:<16} {}",
-            event.pid, comm, filename
-        );
-    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -231,39 +351,12 @@ fn classify_access(flags: u32) -> &'static str {
     }
 }
 
-/// Drop entirely (not written to JSONL or console).
+/// Drop entirely -- not relevant for CI tracing.
 fn is_skip_path(path: &str) -> bool {
     !path.starts_with('/')
         || path.starts_with("/proc/")
         || path.starts_with("/sys/")
         || path.starts_with("/dev/")
-}
-
-/// Infrastructure noise -- written to JSONL for completeness but hidden
-/// from the console so the human-readable output only shows project files.
-fn is_infra_path(path: &str) -> bool {
-    path.starts_with("/lib/")
-        || path.starts_with("/usr/lib/")
-        || path.starts_with("/usr/share/")
-        || path.starts_with("/usr/bin/")
-        || path.starts_with("/etc/")
-        || path.starts_with("/run/")
-        || path.starts_with("/__e/")
-        || path.starts_with("/__t/")
-        || path.starts_with("/__w/_actions/")
-        || path.starts_with("/__w/_temp/")
-        || path.starts_with("/github/")
-        || path.starts_with("/home/runner/")
-        || path.starts_with("/var/")
-        || path.starts_with("/tmp/")
-        || path.starts_with("/data/")
-        || path.starts_with("/runc")
-        || path == "/"
-        || path.contains("/node_modules/")
-        || path.contains("/.npm/")
-        || path.ends_with(".so")
-        || path.contains(".so.")
-        || path.ends_with(".cache")
 }
 
 fn bump_memlock_rlimit() {
