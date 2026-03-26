@@ -127,6 +127,11 @@ async fn main() -> Result<()> {
         .context("failed to open /var/log/ci-trace.jsonl")?;
     let mut writer = BufWriter::new(file);
 
+    let workspace = std::env::var("GITHUB_WORKSPACE").unwrap_or_default();
+    if !workspace.is_empty() {
+        eprintln!("[ci-recorder] Workspace: {workspace}");
+    }
+
     let mut tree = ProcessTree::new();
     let mut stats = Stats::default();
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -134,7 +139,7 @@ async fn main() -> Result<()> {
     loop {
         let mut had_events = false;
         while let Some(item) = ring_buf.next() {
-            handle_event(&item, &mut writer, &mut tree, &mut stats);
+            handle_event(&item, &mut writer, &mut tree, &mut stats, &workspace);
             had_events = true;
         }
         if had_events {
@@ -149,7 +154,7 @@ async fn main() -> Result<()> {
     }
 
     while let Some(item) = ring_buf.next() {
-        handle_event(&item, &mut writer, &mut tree, &mut stats);
+        handle_event(&item, &mut writer, &mut tree, &mut stats, &workspace);
     }
     let _ = writer.flush();
 
@@ -191,6 +196,7 @@ fn handle_event(
     writer: &mut BufWriter<std::fs::File>,
     tree: &mut ProcessTree,
     stats: &mut Stats,
+    workspace: &str,
 ) {
     if data.len() < 4 {
         return;
@@ -201,7 +207,7 @@ fn handle_event(
     match event_type {
         EVENT_PROCESS_EXEC => handle_exec(data, writer, tree, stats),
         EVENT_PROCESS_EXIT => handle_exit(data, writer, tree, stats),
-        EVENT_FILE_OPEN => handle_file_open(data, writer, tree, stats),
+        EVENT_FILE_OPEN => handle_file_open(data, writer, tree, stats, workspace),
         _ => {}
     }
 }
@@ -290,6 +296,7 @@ fn handle_file_open(
     writer: &mut BufWriter<std::fs::File>,
     tree: &mut ProcessTree,
     stats: &mut Stats,
+    workspace: &str,
 ) {
     if data.len() < std::mem::size_of::<FileOpenEvent>() {
         return;
@@ -304,7 +311,7 @@ fn handle_file_open(
         return;
     };
 
-    if is_skip_path(filename) {
+    if is_skip_path(filename, workspace) {
         return;
     }
 
@@ -352,14 +359,16 @@ fn classify_access(flags: u32) -> &'static str {
     }
 }
 
-/// Skip non-paths and virtual filesystems. The whitelist + process tree
-/// already limits events to tracked commands, so no workspace filter needed.
-fn is_skip_path(path: &str) -> bool {
-    !path.starts_with('/')
-        || path.starts_with("/proc/")
-        || path.starts_with("/sys/")
-        || path.starts_with("/dev/")
-        || path.contains("/node_modules/")
+/// Only keep files inside the workspace directory. Drops system libs,
+/// locale files, shared objects, /etc, /tmp, and node_modules.
+fn is_skip_path(path: &str, workspace: &str) -> bool {
+    if !path.starts_with('/') {
+        return true;
+    }
+    if !workspace.is_empty() && !path.starts_with(workspace) {
+        return true;
+    }
+    path.contains("/node_modules/")
 }
 
 fn bump_memlock_rlimit() {
