@@ -9,11 +9,13 @@ async function run() {
     if (fs.existsSync(PID_FILE)) {
       const pid = fs.readFileSync(PID_FILE, 'utf8').trim();
       try {
-        // The tracer runs under sudo, so we need sudo to kill it
         execSync(`sudo kill -TERM ${pid}`);
         await new Promise(r => setTimeout(r, 2000));
       } catch {}
     }
+
+    // Make trace file readable by the runner user for artifact upload
+    try { execSync(`sudo chmod 644 ${TRACE_FILE} 2>/dev/null || true`); } catch {}
 
     if (fs.existsSync(TRACE_FILE)) {
       const stat = fs.statSync(TRACE_FILE);
