@@ -30,6 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /build/target/release/ci-tracer /usr/local/bin/ci-tracer
 COPY entrypoint.sh /entrypoint.sh
 COPY start-ci-tracer.sh /usr/local/bin/start-ci-tracer
-RUN chmod +x /entrypoint.sh /usr/local/bin/start-ci-tracer
+RUN sed -i 's/\r$//' /entrypoint.sh /usr/local/bin/start-ci-tracer \
+    && chmod +x /entrypoint.sh /usr/local/bin/start-ci-tracer
 
 ENTRYPOINT ["/entrypoint.sh"]

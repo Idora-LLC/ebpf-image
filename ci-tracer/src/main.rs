@@ -1,6 +1,5 @@
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
-use std::os::unix::fs::MetadataExt;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -17,27 +16,18 @@ use ci_tracer_common::*;
 async fn main() -> Result<()> {
     bump_memlock_rlimit();
 
-    let mut bpf = Ebpf::load(include_bytes!(concat!(
+    #[repr(C, align(8))]
+    struct Aligned<T: ?Sized>(T);
+    static BPF_OBJ: &Aligned<[u8]> = &Aligned(*include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../target/bpfel-unknown-none/release/ci-tracer-ebpf"
-    )))?;
+    )));
+
+    let mut bpf = Ebpf::load(&BPF_OBJ.0)?;
 
     attach_tracepoint(&mut bpf, "trace_exec", "sched", "sched_process_exec")?;
     attach_tracepoint(&mut bpf, "trace_exit", "sched", "sched_process_exit")?;
     attach_tracepoint(&mut bpf, "trace_openat", "syscalls", "sys_enter_openat")?;
-
-    // Scope tracing to this container's cgroup so we ignore host processes.
-    {
-        let cgroup_id = get_own_cgroup_id().unwrap_or(0);
-        let mut map: aya::maps::HashMap<_, u32, u64> =
-            aya::maps::HashMap::try_from(bpf.map_mut("TARGET_CGROUPID").unwrap())?;
-        map.insert(0u32, cgroup_id, 0)?;
-        if cgroup_id > 0 {
-            eprintln!("[ci-recorder] Filtering to container cgroup {cgroup_id}");
-        } else {
-            eprintln!("[ci-recorder] WARNING: could not detect cgroup, tracing everything");
-        }
-    }
 
     eprintln!("[ci-recorder] Tracer started, attaching eBPF probes...");
 
@@ -76,28 +66,6 @@ async fn main() -> Result<()> {
     );
 
     Ok(())
-}
-
-/// Read our own cgroup v2 ID so the BPF program can filter by it.
-fn get_own_cgroup_id() -> Result<u64> {
-    let content = std::fs::read_to_string("/proc/self/cgroup")
-        .context("failed to read /proc/self/cgroup")?;
-
-    for line in content.lines() {
-        if let Some(path) = line.strip_prefix("0::") {
-            let path = path.trim();
-            let full = if path.is_empty() || path == "/" {
-                "/sys/fs/cgroup".to_string()
-            } else {
-                format!("/sys/fs/cgroup{path}")
-            };
-            let meta = std::fs::metadata(&full)
-                .with_context(|| format!("failed to stat {full}"))?;
-            return Ok(meta.ino());
-        }
-    }
-
-    anyhow::bail!("no cgroup v2 entry in /proc/self/cgroup")
 }
 
 fn attach_tracepoint(

@@ -3,12 +3,11 @@
 
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-        bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_probe_read_kernel_str_bytes,
-        bpf_probe_read_user_str_bytes,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
+        bpf_ktime_get_ns, bpf_probe_read_kernel_str_bytes, bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint},
-    maps::{HashMap, LruHashMap, PerCpuArray, RingBuf},
+    maps::{LruHashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
     EbpfContext,
 };
@@ -17,13 +16,6 @@ use ci_tracer_common::*;
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
-
-/// Set by userspace to the container's cgroup v2 ID.
-/// Only events from this cgroup (and descendants) are emitted.
-/// Uses HashMap instead of Array for aya ELF compatibility.
-/// Key 0 → target cgroup ID. Absent or 0 means "drop all events".
-#[map]
-static TARGET_CGROUPID: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
 
 /// Tracks process start times for duration calculation on exit.
 #[map]
@@ -36,21 +28,6 @@ static EXEC_BUF: PerCpuArray<ProcessExecEvent> = PerCpuArray::with_max_entries(1
 /// Per-CPU scratch buffer for file-open events.
 #[map]
 static FILE_BUF: PerCpuArray<FileOpenEvent> = PerCpuArray::with_max_entries(1, 0);
-
-/// Returns true if the current task belongs to the target container cgroup.
-#[inline(always)]
-unsafe fn in_target_cgroup() -> bool {
-    let key: u32 = 0;
-    if let Some(target) = TARGET_CGROUPID.get(&key) {
-        let target_id = *target;
-        if target_id == 0 {
-            return false;
-        }
-        bpf_get_current_cgroup_id() == target_id
-    } else {
-        false
-    }
-}
 
 // ---------------------------------------------------------------------------
 // sched_process_exec – fires when a process calls execve()
@@ -69,10 +46,6 @@ pub fn trace_exec(ctx: TracePointContext) -> u32 {
 }
 
 unsafe fn try_trace_exec(ctx: &TracePointContext) -> Result<(), i64> {
-    if !in_target_cgroup() {
-        return Ok(());
-    }
-
     let ts = bpf_ktime_get_ns();
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = pid_tgid as u32;
@@ -123,10 +96,6 @@ pub fn trace_exit(ctx: TracePointContext) -> u32 {
 }
 
 unsafe fn try_trace_exit(ctx: &TracePointContext) -> Result<(), i64> {
-    if !in_target_cgroup() {
-        return Ok(());
-    }
-
     let ts = bpf_ktime_get_ns();
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = pid_tgid as u32;
@@ -178,10 +147,6 @@ pub fn trace_openat(ctx: TracePointContext) -> u32 {
 }
 
 unsafe fn try_trace_openat(ctx: &TracePointContext) -> Result<(), i64> {
-    if !in_target_cgroup() {
-        return Ok(());
-    }
-
     let ts = bpf_ktime_get_ns();
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = pid_tgid as u32;
