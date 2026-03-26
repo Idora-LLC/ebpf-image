@@ -15,7 +15,7 @@ use aya_ebpf::{
 use ci_tracer_common::*;
 
 #[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+static EVENTS: RingBuf = RingBuf::with_byte_size(16 * 1024 * 1024, 0);
 
 /// Tracks process start times for duration calculation on exit.
 #[map]
