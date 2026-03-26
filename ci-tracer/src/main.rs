@@ -352,21 +352,14 @@ fn classify_access(flags: u32) -> &'static str {
     }
 }
 
-/// Only keep files under the workspace mount (/__w/).
-/// Everything else (system libs, /etc, /tmp, etc.) is dropped.
+/// Skip non-paths and virtual filesystems. The whitelist + process tree
+/// already limits events to tracked commands, so no workspace filter needed.
 fn is_skip_path(path: &str) -> bool {
-    if !path.starts_with('/') {
-        return true;
-    }
-    if !path.starts_with("/__w/") {
-        return true;
-    }
-    is_blacklisted(path)
-}
-
-/// Paths inside the workspace that are still noise.
-fn is_blacklisted(path: &str) -> bool {
-    path.contains("/node_modules/")
+    !path.starts_with('/')
+        || path.starts_with("/proc/")
+        || path.starts_with("/sys/")
+        || path.starts_with("/dev/")
+        || path.contains("/node_modules/")
 }
 
 fn bump_memlock_rlimit() {
