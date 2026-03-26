@@ -204,7 +204,7 @@ fn handle_file_open(
     let comm = bytes_to_str(&event.comm);
     let filename = bytes_to_str(&event.filename);
 
-    if is_noise_path(filename) {
+    if is_skip_path(filename) {
         return;
     }
 
@@ -215,18 +215,6 @@ fn handle_file_open(
         _ => stats.files_written += 1,
     }
 
-    let label = match access {
-        "read" => "READ ",
-        "write" => "WRITE",
-        "create" => "CREAT",
-        _ => "FILE ",
-    };
-
-    eprintln!(
-        "[ci-recorder] {label}  pid={:<6} {:<16} {}",
-        event.pid, comm, filename
-    );
-
     let j = json!({
         "ts": now,
         "event": "open",
@@ -236,6 +224,19 @@ fn handle_file_open(
         "access": access,
     });
     let _ = writeln!(writer, "{j}");
+
+    if !is_infra_path(filename) {
+        let label = match access {
+            "read" => "READ ",
+            "write" => "WRITE",
+            "create" => "CREAT",
+            _ => "FILE ",
+        };
+        eprintln!(
+            "[ci-recorder] {label}  pid={:<6} {:<16} {}",
+            event.pid, comm, filename
+        );
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -259,11 +260,34 @@ fn classify_access(flags: u32) -> &'static str {
     }
 }
 
-fn is_noise_path(path: &str) -> bool {
+/// Drop entirely (not written to JSONL or console).
+fn is_skip_path(path: &str) -> bool {
     !path.starts_with('/')
         || path.starts_with("/proc/")
         || path.starts_with("/sys/")
         || path.starts_with("/dev/")
+}
+
+/// Infrastructure noise -- written to JSONL for completeness but hidden
+/// from the console so the human-readable output only shows project files.
+fn is_infra_path(path: &str) -> bool {
+    path.starts_with("/lib/")
+        || path.starts_with("/usr/lib/")
+        || path.starts_with("/usr/share/")
+        || path.starts_with("/etc/")
+        || path.starts_with("/__e/")
+        || path.starts_with("/__t/")
+        || path.starts_with("/__w/_actions/")
+        || path.starts_with("/__w/_temp/")
+        || path.starts_with("/github/")
+        || path.starts_with("/home/runner/")
+        || path.starts_with("/var/")
+        || path.starts_with("/tmp/")
+        || path.contains("/node_modules/")
+        || path.contains("/.npm/")
+        || path.ends_with(".so")
+        || path.contains(".so.")
+        || path.ends_with(".cache")
 }
 
 fn bump_memlock_rlimit() {
