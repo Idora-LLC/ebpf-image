@@ -29,9 +29,9 @@ async fn main() -> Result<()> {
     // Scope tracing to this container's cgroup so we ignore host processes.
     {
         let cgroup_id = get_own_cgroup_id().unwrap_or(0);
-        let mut arr: aya::maps::Array<_, u64> =
-            aya::maps::Array::try_from(bpf.map_mut("TARGET_CGROUPID").unwrap())?;
-        arr.set(0, cgroup_id, 0)?;
+        let mut map: aya::maps::HashMap<_, u32, u64> =
+            aya::maps::HashMap::try_from(bpf.map_mut("TARGET_CGROUPID").unwrap())?;
+        map.insert(0u32, cgroup_id, 0)?;
         if cgroup_id > 0 {
             eprintln!("[ci-recorder] Filtering to container cgroup {cgroup_id}");
         } else {

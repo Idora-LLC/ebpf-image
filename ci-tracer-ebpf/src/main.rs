@@ -8,7 +8,7 @@ use aya_ebpf::{
         bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint},
-    maps::{Array, LruHashMap, PerCpuArray, RingBuf},
+    maps::{HashMap, LruHashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
     EbpfContext,
 };
@@ -20,9 +20,10 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 /// Set by userspace to the container's cgroup v2 ID.
 /// Only events from this cgroup (and descendants) are emitted.
-/// A value of 0 means "not configured yet" and all events are dropped.
+/// Uses HashMap instead of Array for aya ELF compatibility.
+/// Key 0 → target cgroup ID. Absent or 0 means "drop all events".
 #[map]
-static TARGET_CGROUPID: Array<u64> = Array::with_max_entries(1, 0);
+static TARGET_CGROUPID: HashMap<u32, u64> = HashMap::with_max_entries(1, 0);
 
 /// Tracks process start times for duration calculation on exit.
 #[map]
@@ -39,7 +40,8 @@ static FILE_BUF: PerCpuArray<FileOpenEvent> = PerCpuArray::with_max_entries(1, 0
 /// Returns true if the current task belongs to the target container cgroup.
 #[inline(always)]
 unsafe fn in_target_cgroup() -> bool {
-    if let Some(target) = TARGET_CGROUPID.get(0) {
+    let key: u32 = 0;
+    if let Some(target) = TARGET_CGROUPID.get(&key) {
         let target_id = *target;
         if target_id == 0 {
             return false;
