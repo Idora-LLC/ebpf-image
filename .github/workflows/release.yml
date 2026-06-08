@@ -1,0 +1,75 @@
+name: Release
+
+# Builds the recorder binary on a tag, generates a SHA-256 checksum, signs the
+# artifact (keyless cosign), and publishes them as release assets. The Action's
+# start.js downloads `ci-tracer-linux-amd64` + `.sha256` by this tag and
+# checksum-verifies before executing (specs/security.md §4, specs/deployment.md §2).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build'
+        required: true
+
+permissions:
+  contents: write
+  id-token: write   # cosign keyless signing
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      ASSET: ci-tracer-linux-amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev build-essential pkg-config
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable
+          rustup toolchain install nightly --component rust-src
+          cargo install bpf-linker --locked
+
+      # Reproducible-ish build: pin paths and disable timestamp-y env (specs/security.md §4).
+      - name: Build eBPF + userspace (release)
+        env:
+          SOURCE_DATE_EPOCH: '0'
+          CARGO_INCREMENTAL: '0'
+        run: |
+          cargo xtask build-ebpf --profile release
+          cargo build --package ci-tracer --release --locked
+
+      - name: Package + checksum
+        run: |
+          mkdir -p dist
+          cp target/release/ci-tracer "dist/${ASSET}"
+          cd dist
+          sha256sum "${ASSET}" > "${ASSET}.sha256"
+          cat "${ASSET}.sha256"
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign artifact (keyless)
+        run: |
+          cosign sign-blob --yes \
+            --output-signature "dist/${ASSET}.sig" \
+            --output-certificate "dist/${ASSET}.pem" \
+            "dist/${ASSET}"
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            dist/${{ env.ASSET }}
+            dist/${{ env.ASSET }}.sha256
+            dist/${{ env.ASSET }}.sig
+            dist/${{ env.ASSET }}.pem

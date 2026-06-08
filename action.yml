@@ -1,0 +1,39 @@
+name: 'Idora CI Recorder'
+description: 'eBPF-based execution recorder: observes build/test/deploy I/O, content-hashes inputs/outputs, and submits an execution RunRecord to the Idora pipeline.'
+author: 'Idora LLC'
+
+inputs:
+  pipeline-url:
+    description: 'Base URL of the Idora pipeline service (the /pipeline/process path is appended).'
+    required: false
+  pipeline-token:
+    description: 'Bearer token for the pipeline (a CI secret). Held in memory only, never logged or persisted.'
+    required: false
+  whitelist:
+    description: 'Comma-separated commands that root an operation, each optionally tagged "command=>type" (build|test|deploy).'
+    required: false
+    default: 'npm run build=>build,npm run test=>test'
+  type:
+    description: 'Authoritative operation type hint for this job (build|test|deploy). Overrides whitelist tags and heuristics.'
+    required: false
+  deploy-target:
+    description: 'Deploy destination (e.g. prod|staging), carried on the sidecar.'
+    required: false
+  env-allowlist:
+    description: 'Comma-separated environment keys the recorder may capture (allowlist-only). Default: capture nothing.'
+    required: false
+    default: ''
+  hard-fail:
+    description: 'Fail the build when eBPF is unavailable instead of no-op (default: no-op, reconciled as unknown).'
+    required: false
+    default: 'false'
+  version:
+    description: 'Release tag of the recorder binary to download. Defaults to the action ref.'
+    required: false
+
+runs:
+  using: 'node20'
+  pre: 'action/start.js'
+  main: 'action/noop.js'
+  post: 'action/stop.js'
+  post-if: 'always()'

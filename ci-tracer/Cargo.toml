@@ -1,13 +1,37 @@
 [package]
 name = "ci-tracer"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Self-hosted-only kernel-atomic hashing tier (BPF-LSM / bpf_ima_file_hash).
+# Cannot be enabled on hosted runners (BPF-LSM needs a GRUB change + reboot);
+# see specs/content-hashing.md §4.
+kernel-atomic = []
+
+[lib]
+name = "ci_tracer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ci-tracer"
+path = "src/main.rs"
 
 [dependencies]
 aya = "0.13"
-anyhow = "1"
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { version = "1", features = ["macros", "rt", "signal", "time"] }
-serde_json = "1"
-chrono = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 libc = "0.2"
+ureq = "2"
+uuid = { version = "1", features = ["v4"] }
 ci-tracer-common = { path = "../ci-tracer-common" }
+
+[dev-dependencies]
+tempfile = "3"
