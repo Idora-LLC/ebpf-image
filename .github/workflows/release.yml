@@ -60,8 +60,7 @@ jobs:
       - name: Sign artifact (keyless)
         run: |
           cosign sign-blob --yes \
-            --output-signature "dist/${ASSET}.sig" \
-            --output-certificate "dist/${ASSET}.pem" \
+            --bundle "dist/${ASSET}.bundle" \
             "dist/${ASSET}"
 
       - name: Publish release assets
@@ -71,5 +70,4 @@ jobs:
           files: |
             dist/${{ env.ASSET }}
             dist/${{ env.ASSET }}.sha256
-            dist/${{ env.ASSET }}.sig
-            dist/${{ env.ASSET }}.pem
+            dist/${{ env.ASSET }}.bundle
