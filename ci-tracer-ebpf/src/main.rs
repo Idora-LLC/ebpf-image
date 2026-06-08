@@ -102,9 +102,14 @@ unsafe fn try_trace_fork(ctx: &TracePointContext) -> Result<(), i64> {
         }
     }
     // #endregion
-    let parent_pid: u32 = ctx.read_at::<i32>(24).map(|v| v as u32)?;
-    let child_pid: u32 = ctx.read_at::<i32>(44).map(|v| v as u32)?;
-    let _ = PARENT_MAP.insert(&child_pid, &parent_pid, 0);
+    // The forking task is `current`, so the parent tgid is reliable without any
+    // tracepoint-offset guessing. The child pid is read from the fork tracepoint
+    // (offset verified empirically for the hosted-runner kernel; debug 5d16d6).
+    let parent_pid: u32 = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let child_pid: u32 = ctx.read_at::<u32>(20).unwrap_or(0);
+    if child_pid != 0 {
+        let _ = PARENT_MAP.insert(&child_pid, &parent_pid, 0);
+    }
     Ok(())
 }
 
