@@ -132,6 +132,26 @@ async fn run(config: Config, mut reconciler: Reconciler) -> Result<()> {
     }
 
     // #region agent log
+    // Inspect the kernel PARENT_MAP directly to see whether the fork tracepoint
+    // is populating it (HYP=F). Drop the ring buffer first to release its &mut bpf.
+    drop(ring_buf);
+    match bpf.map("PARENT_MAP") {
+        Some(m) => match aya::maps::HashMap::<_, u32, u32>::try_from(m) {
+            Ok(pm) => {
+                let mut count = 0u32;
+                let mut samples: Vec<(u32, u32)> = Vec::new();
+                for item in pm.iter().flatten() {
+                    count += 1;
+                    if samples.len() < 12 {
+                        samples.push(item);
+                    }
+                }
+                eprintln!("[dbg 5d16d6 HYP=F] PARENT_MAP child->parent entries={count} samples={samples:?}");
+            }
+            Err(e) => eprintln!("[dbg 5d16d6 HYP=F] PARENT_MAP try_from error: {e}"),
+        },
+        None => eprintln!("[dbg 5d16d6 HYP=F] PARENT_MAP not found"),
+    }
     tree.debug_summary();
     // #endregion
 
