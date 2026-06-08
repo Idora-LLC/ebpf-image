@@ -108,7 +108,7 @@ fn header(request: &Request, name: &str) -> Option<String> {
     request
         .headers()
         .iter()
-        .find(|h| h.field.equiv(name))
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
         .map(|h| h.value.as_str().to_string())
 }
 
