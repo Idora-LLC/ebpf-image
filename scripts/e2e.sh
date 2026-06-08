@@ -44,7 +44,7 @@ cat > "$REPO/package.json" <<'JSON'
   "name": "e2e-sample",
   "version": "1.0.0",
   "scripts": {
-    "build": "mkdir -p dist && cat src/index.ts > dist/index.js && echo built"
+    "build": "mkdir -p dist && cat src/index.ts > dist/index.js && cat \"$PWD/src/index.ts\" > dist/abs.js && node -e \"require('fs').readFileSync('src/index.ts')\" && echo built"
   }
 }
 JSON

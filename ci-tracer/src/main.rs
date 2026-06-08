@@ -131,6 +131,10 @@ async fn run(config: Config, mut reconciler: Reconciler) -> Result<()> {
         process_operation(op, &adapter, submitter.as_ref(), debug_records.as_deref(), &mut reconciler);
     }
 
+    // #region agent log
+    tree.debug_summary();
+    // #endregion
+
     // Last chance to resend buffered records before the workspace disappears.
     if let Some(s) = submitter.as_ref() {
         let _ = reconciler.flush_buffered(s);
@@ -185,6 +189,20 @@ fn process_operation(
         body.run_record.outputs.as_ref().map(|v| v.len()).unwrap_or(0),
         body.run_record.exit_code,
     );
+    // #region agent log
+    eprintln!(
+        "[dbg 5d16d6 HYP=AE op] root_pid={} wd={:?} recorded={} relative={} scoped_in={} scoped_out={}",
+        op.root_pid,
+        op.working_directory,
+        op.dbg_recorded,
+        op.dbg_relative,
+        op.scoped_inputs().len(),
+        op.scoped_outputs().len(),
+    );
+    for s in &op.dbg_samples {
+        eprintln!("[dbg 5d16d6 HYP=AE op_sample] {s}");
+    }
+    // #endregion
 
     if let Some(path) = debug_records {
         if let Err(e) = append_debug_record(path, &body) {

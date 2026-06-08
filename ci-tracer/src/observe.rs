@@ -67,6 +67,11 @@ pub struct Operation {
     pub end_time: Option<DateTime<Utc>>,
     pids: std::collections::HashSet<u32>,
     paths: HashMap<String, PathState>,
+    // #region agent log
+    pub dbg_recorded: u64,
+    pub dbg_relative: u64,
+    pub dbg_samples: Vec<String>,
+    // #endregion
 }
 
 impl Operation {
@@ -84,10 +89,24 @@ impl Operation {
             end_time: None,
             pids,
             paths: HashMap::new(),
+            // #region agent log
+            dbg_recorded: 0,
+            dbg_relative: 0,
+            dbg_samples: Vec::new(),
+            // #endregion
         }
     }
 
     fn record(&mut self, path: &str, access: Access) {
+        // #region agent log
+        self.dbg_recorded += 1;
+        if !path.starts_with('/') {
+            self.dbg_relative += 1;
+        }
+        if self.dbg_samples.len() < 12 {
+            self.dbg_samples.push(format!("{access:?}:{path}"));
+        }
+        // #endregion
         let st = self.paths.entry(path.to_string()).or_default();
         match access {
             Access::Read => st.read = true,
@@ -139,6 +158,13 @@ pub struct ProcessTree {
     tracked: HashMap<u32, Membership>,
     /// root PID -> open operation.
     operations: HashMap<u32, Operation>,
+    // #region agent log
+    dbg_file_total: u64,
+    dbg_attributed: u64,
+    dbg_unattributed: u64,
+    dbg_unattr_samples: Vec<String>,
+    dbg_attr_samples: Vec<String>,
+    // #endregion
 }
 
 impl ProcessTree {
@@ -148,8 +174,32 @@ impl ProcessTree {
             parents: HashMap::new(),
             tracked: HashMap::new(),
             operations: HashMap::new(),
+            // #region agent log
+            dbg_file_total: 0,
+            dbg_attributed: 0,
+            dbg_unattributed: 0,
+            dbg_unattr_samples: Vec::new(),
+            dbg_attr_samples: Vec::new(),
+            // #endregion
         }
     }
+
+    // #region agent log
+    /// Emit a one-shot attribution summary (debug session 5d16d6) to stderr,
+    /// which is captured in the CI job log.
+    pub fn debug_summary(&self) {
+        eprintln!(
+            "[dbg 5d16d6 HYP=BCD] file_events_total={} attributed={} unattributed={}",
+            self.dbg_file_total, self.dbg_attributed, self.dbg_unattributed
+        );
+        for s in &self.dbg_attr_samples {
+            eprintln!("[dbg 5d16d6 HYP=AE attr_sample] {s}");
+        }
+        for s in &self.dbg_unattr_samples {
+            eprintln!("[dbg 5d16d6 HYP=BC unattr_sample] {s}");
+        }
+    }
+    // #endregion
 
     /// Number of currently open (un-finalized) operations.
     pub fn open_count(&self) -> usize {
@@ -231,9 +281,26 @@ impl ProcessTree {
     }
 
     pub fn on_file(&mut self, e: &FileEvent, proc: &dyn ProcSource) {
+        // #region agent log
+        self.dbg_file_total += 1;
+        // #endregion
         let Some(root_pid) = self.membership(e.pid, &e.comm, proc) else {
+            // #region agent log
+            self.dbg_unattributed += 1;
+            if self.dbg_unattr_samples.len() < 15 {
+                self.dbg_unattr_samples
+                    .push(format!("pid={} comm={} {:?}:{}", e.pid, e.comm, e.access, e.path));
+            }
+            // #endregion
             return;
         };
+        // #region agent log
+        self.dbg_attributed += 1;
+        if self.dbg_attr_samples.len() < 15 {
+            self.dbg_attr_samples
+                .push(format!("pid={} comm={} {:?}:{}", e.pid, e.comm, e.access, e.path));
+        }
+        // #endregion
         if let Some(op) = self.operations.get_mut(&root_pid) {
             op.record(&e.path, e.access);
         }
