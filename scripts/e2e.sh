@@ -83,6 +83,10 @@ COUNT="$(wc -l < "$MOCK_LOG")"
 echo "submitted records: $COUNT"
 grep -q '"type":"build"' "$MOCK_LOG" || { echo "FAIL: no build record"; exit 1; }
 grep -q "$COMMIT" "$MOCK_LOG" || { echo "FAIL: commit not recorded"; exit 1; }
+# Guard against the attribution/relative-path regression: the build reads
+# src/index.ts and writes dist/*, so inputs and outputs must be non-empty.
+grep -q '"inputs":\[' "$MOCK_LOG" || { echo "FAIL: inputs empty (attribution/scope regression)"; exit 1; }
+grep -q '"outputs":\[' "$MOCK_LOG" || { echo "FAIL: outputs empty (attribution/scope regression)"; exit 1; }
 
 SIGNAL="$STATE/ci-recorder-reconciliation.json"
 [[ -f "$SIGNAL" ]] || { echo "FAIL: no reconciliation signal"; exit 1; }

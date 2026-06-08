@@ -131,41 +131,6 @@ async fn run(config: Config, mut reconciler: Reconciler) -> Result<()> {
         process_operation(op, &adapter, submitter.as_ref(), debug_records.as_deref(), &mut reconciler);
     }
 
-    // #region agent log
-    // Inspect the kernel PARENT_MAP directly to see whether the fork tracepoint
-    // is populating it (HYP=F). Drop the ring buffer first to release its &mut bpf.
-    drop(ring_buf);
-    match bpf.map("PARENT_MAP") {
-        Some(m) => match aya::maps::HashMap::<_, u32, u32>::try_from(m) {
-            Ok(pm) => {
-                let mut count = 0u32;
-                let mut samples: Vec<(u32, u32)> = Vec::new();
-                for item in pm.iter().flatten() {
-                    count += 1;
-                    if samples.len() < 12 {
-                        samples.push(item);
-                    }
-                }
-                eprintln!("[dbg 5d16d6 HYP=F] PARENT_MAP child->parent entries={count} samples={samples:?}");
-            }
-            Err(e) => eprintln!("[dbg 5d16d6 HYP=F] PARENT_MAP try_from error: {e}"),
-        },
-        None => eprintln!("[dbg 5d16d6 HYP=F] PARENT_MAP not found"),
-    }
-    if let Some(m) = bpf.map("FORK_PROBE") {
-        if let Ok(arr) = aya::maps::Array::<_, u32>::try_from(m) {
-            let labels = [
-                "off4", "off8", "off12", "off16", "off20", "off44", "off48", "off52",
-                "cur_tgid", "cur_pid",
-            ];
-            for (i, label) in labels.iter().enumerate() {
-                let v = arr.get(&(i as u32), 0).unwrap_or(0);
-                eprintln!("[dbg 5d16d6 HYP=F probe] {label}={v}");
-            }
-        }
-    }
-    tree.debug_summary();
-    // #endregion
 
     // Last chance to resend buffered records before the workspace disappears.
     if let Some(s) = submitter.as_ref() {
@@ -221,21 +186,6 @@ fn process_operation(
         body.run_record.outputs.as_ref().map(|v| v.len()).unwrap_or(0),
         body.run_record.exit_code,
     );
-    // #region agent log
-    eprintln!(
-        "[dbg 5d16d6 HYP=AE op] root_pid={} wd={:?} recorded={} relative={} scoped_in={} scoped_out={}",
-        op.root_pid,
-        op.working_directory,
-        op.dbg_recorded,
-        op.dbg_relative,
-        op.scoped_inputs().len(),
-        op.scoped_outputs().len(),
-    );
-    for s in &op.dbg_samples {
-        eprintln!("[dbg 5d16d6 HYP=AE op_sample] {s}");
-    }
-    // #endregion
-
     if let Some(path) = debug_records {
         if let Err(e) = append_debug_record(path, &body) {
             eprintln!("[ci-recorder] failed to write debug record: {e}");

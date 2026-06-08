@@ -67,11 +67,6 @@ pub struct Operation {
     pub end_time: Option<DateTime<Utc>>,
     pids: std::collections::HashSet<u32>,
     paths: HashMap<String, PathState>,
-    // #region agent log
-    pub dbg_recorded: u64,
-    pub dbg_relative: u64,
-    pub dbg_samples: Vec<String>,
-    // #endregion
 }
 
 impl Operation {
@@ -89,24 +84,10 @@ impl Operation {
             end_time: None,
             pids,
             paths: HashMap::new(),
-            // #region agent log
-            dbg_recorded: 0,
-            dbg_relative: 0,
-            dbg_samples: Vec::new(),
-            // #endregion
         }
     }
 
     fn record(&mut self, path: &str, access: Access) {
-        // #region agent log
-        self.dbg_recorded += 1;
-        if !path.starts_with('/') {
-            self.dbg_relative += 1;
-        }
-        if self.dbg_samples.len() < 12 {
-            self.dbg_samples.push(format!("{access:?}:{path}"));
-        }
-        // #endregion
         let st = self.paths.entry(path.to_string()).or_default();
         match access {
             Access::Read => st.read = true,
@@ -170,14 +151,6 @@ pub struct ProcessTree {
     tracked: HashMap<u32, Membership>,
     /// root PID -> open operation.
     operations: HashMap<u32, Operation>,
-    // #region agent log
-    dbg_file_total: u64,
-    dbg_attributed: u64,
-    dbg_unattributed: u64,
-    dbg_unattr_samples: Vec<String>,
-    dbg_attr_samples: Vec<String>,
-    dbg_exec_samples: Vec<String>,
-    // #endregion
 }
 
 impl ProcessTree {
@@ -187,61 +160,8 @@ impl ProcessTree {
             parents: HashMap::new(),
             tracked: HashMap::new(),
             operations: HashMap::new(),
-            // #region agent log
-            dbg_file_total: 0,
-            dbg_attributed: 0,
-            dbg_unattributed: 0,
-            dbg_unattr_samples: Vec::new(),
-            dbg_attr_samples: Vec::new(),
-            dbg_exec_samples: Vec::new(),
-            // #endregion
         }
     }
-
-    // #region agent log
-    /// Whether a path is part of the (e2e) repo build I/O rather than system noise.
-    fn dbg_interesting(path: &str) -> bool {
-        !path.starts_with('/') || path.contains("/repo/")
-    }
-
-    /// Walk the parent chain for `pid`, marking which entries are tracked,
-    /// so we can see exactly where attribution breaks.
-    fn dbg_chain(&self, pid: u32) -> String {
-        let mut out = String::new();
-        let mut cursor = pid;
-        for _ in 0..16 {
-            let t = if self.tracked.contains_key(&cursor) { "T" } else { "-" };
-            out.push_str(&format!("{cursor}{t} "));
-            match self.parents.get(&cursor) {
-                Some(&p) => cursor = p,
-                None => {
-                    out.push_str("|noparent");
-                    break;
-                }
-            }
-        }
-        out
-    }
-
-    /// Emit a one-shot attribution summary (debug session 5d16d6) to stderr,
-    /// which is captured in the CI job log.
-    pub fn debug_summary(&self) {
-        eprintln!(
-            "[dbg 5d16d6 HYP=BCD] file_events_total={} attributed={} unattributed={} parents_map={} tracked_map={}",
-            self.dbg_file_total, self.dbg_attributed, self.dbg_unattributed,
-            self.parents.len(), self.tracked.len()
-        );
-        for s in &self.dbg_exec_samples {
-            eprintln!("[dbg 5d16d6 HYP=BC exec] {s}");
-        }
-        for s in &self.dbg_attr_samples {
-            eprintln!("[dbg 5d16d6 HYP=AE attr_sample] {s}");
-        }
-        for s in &self.dbg_unattr_samples {
-            eprintln!("[dbg 5d16d6 HYP=BC unattr_sample] {s}");
-        }
-    }
-    // #endregion
 
     /// Number of currently open (un-finalized) operations.
     pub fn open_count(&self) -> usize {
@@ -317,45 +237,15 @@ impl ProcessTree {
 
     pub fn on_exec(&mut self, e: &ExecEvent, proc: &dyn ProcSource) {
         self.set_parent(e.pid, e.ppid);
-        // #region agent log
-        if matches!(
-            e.comm.as_str(),
-            "sh" | "bash" | "dash" | "cat" | "mkdir" | "node" | "nest" | "tsc" | "npm run build"
-        ) && self.dbg_exec_samples.len() < 40
-        {
-            self.dbg_exec_samples
-                .push(format!("pid={} ppid={} comm={}", e.pid, e.ppid, e.comm));
-        }
-        // #endregion
         self.membership(e.pid, &e.comm, proc);
         // Late cwd/command capture if the root was created from a non-root comm.
         self.refresh_root_proc(e.pid, proc);
     }
 
     pub fn on_file(&mut self, e: &FileEvent, proc: &dyn ProcSource) {
-        // #region agent log
-        self.dbg_file_total += 1;
-        // #endregion
         let Some(root_pid) = self.membership(e.pid, &e.comm, proc) else {
-            // #region agent log
-            self.dbg_unattributed += 1;
-            if Self::dbg_interesting(&e.path) && self.dbg_unattr_samples.len() < 25 {
-                let chain = self.dbg_chain(e.pid);
-                self.dbg_unattr_samples.push(format!(
-                    "pid={} comm={} {:?}:{} chain=[{}]",
-                    e.pid, e.comm, e.access, e.path, chain
-                ));
-            }
-            // #endregion
             return;
         };
-        // #region agent log
-        self.dbg_attributed += 1;
-        if Self::dbg_interesting(&e.path) && self.dbg_attr_samples.len() < 25 {
-            self.dbg_attr_samples
-                .push(format!("pid={} comm={} {:?}:{}", e.pid, e.comm, e.access, e.path));
-        }
-        // #endregion
         if let Some(op) = self.operations.get_mut(&root_pid) {
             op.record(&e.path, e.access);
         }
