@@ -135,11 +135,23 @@ impl Operation {
             .paths
             .iter()
             .filter(|(_, st)| pred(st))
-            .map(|(p, _)| p.clone())
+            .map(|(p, _)| resolve_against(p, wd))
             .filter(|p| crate::scope::in_scope(p, wd))
             .collect();
         out.sort();
+        out.dedup();
         out
+    }
+}
+
+/// Resolve a possibly-relative observed path against the operation's working
+/// directory (the relativization root). Tools frequently open files with
+/// `AT_FDCWD`-relative paths; without this they could never be scoped/joined.
+fn resolve_against(path: &str, working_directory: &str) -> String {
+    if path.starts_with('/') || working_directory.is_empty() {
+        path.to_string()
+    } else {
+        format!("{}/{}", working_directory.trim_end_matches('/'), path)
     }
 }
 
