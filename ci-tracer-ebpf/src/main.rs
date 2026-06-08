@@ -16,7 +16,7 @@ use aya_ebpf::{
         bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint},
-    maps::{LruHashMap, PerCpuArray, RingBuf},
+    maps::{Array, LruHashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
 };
 
@@ -36,6 +36,22 @@ static EXIT_CODES: LruHashMap<u32, i32> = LruHashMap::with_max_entries(10240, 0)
 /// Per-CPU scratch for file-access events.
 #[map]
 static FILE_BUF: PerCpuArray<FileAccessEvent> = PerCpuArray::with_max_entries(1, 0);
+
+// #region agent log
+/// Debug (session 5d16d6): captures candidate fork-tracepoint field values from
+/// the first observed fork so userspace can identify the correct offsets.
+/// Indices 0-7 = u32 read at offsets 16,20,24,28,32,36,40,44; 8 = current tgid;
+/// 9 = current pid; 15 = "captured" flag.
+#[map]
+static FORK_PROBE: Array<u32> = Array::with_max_entries(16, 0);
+
+#[inline(always)]
+unsafe fn store_probe(i: u32, v: u32) {
+    if let Some(p) = FORK_PROBE.get_ptr_mut(i) {
+        *p = v;
+    }
+}
+// #endregion
 
 // Open flags (Linux, x86_64).
 const O_WRONLY: u64 = 1;
@@ -68,6 +84,24 @@ pub fn trace_fork(ctx: TracePointContext) -> u32 {
 }
 
 unsafe fn try_trace_fork(ctx: &TracePointContext) -> Result<(), i64> {
+    // #region agent log
+    if let Some(done) = FORK_PROBE.get_ptr_mut(15) {
+        if *done == 0 {
+            *done = 1;
+            store_probe(0, ctx.read_at::<u32>(16).unwrap_or(0));
+            store_probe(1, ctx.read_at::<u32>(20).unwrap_or(0));
+            store_probe(2, ctx.read_at::<u32>(24).unwrap_or(0));
+            store_probe(3, ctx.read_at::<u32>(28).unwrap_or(0));
+            store_probe(4, ctx.read_at::<u32>(32).unwrap_or(0));
+            store_probe(5, ctx.read_at::<u32>(36).unwrap_or(0));
+            store_probe(6, ctx.read_at::<u32>(40).unwrap_or(0));
+            store_probe(7, ctx.read_at::<u32>(44).unwrap_or(0));
+            let pt = bpf_get_current_pid_tgid();
+            store_probe(8, (pt >> 32) as u32);
+            store_probe(9, pt as u32);
+        }
+    }
+    // #endregion
     let parent_pid: u32 = ctx.read_at::<i32>(24).map(|v| v as u32)?;
     let child_pid: u32 = ctx.read_at::<i32>(44).map(|v| v as u32)?;
     let _ = PARENT_MAP.insert(&child_pid, &parent_pid, 0);

@@ -152,6 +152,18 @@ async fn run(config: Config, mut reconciler: Reconciler) -> Result<()> {
         },
         None => eprintln!("[dbg 5d16d6 HYP=F] PARENT_MAP not found"),
     }
+    if let Some(m) = bpf.map("FORK_PROBE") {
+        if let Ok(arr) = aya::maps::Array::<_, u32>::try_from(m) {
+            let labels = [
+                "off16", "off20", "off24", "off28", "off32", "off36", "off40", "off44",
+                "cur_tgid", "cur_pid",
+            ];
+            for (i, label) in labels.iter().enumerate() {
+                let v = arr.get(&(i as u32), 0).unwrap_or(0);
+                eprintln!("[dbg 5d16d6 HYP=F probe] {label}={v}");
+            }
+        }
+    }
     tree.debug_summary();
     // #endregion
 
