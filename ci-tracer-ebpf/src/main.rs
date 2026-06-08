@@ -1,15 +1,23 @@
 #![no_std]
 #![no_main]
 
+//! Kernel-side BPF programs for the Idora Recorder.
+//!
+//! Implements the broadened hook set from `specs/observation.md` §3: process
+//! lifecycle (`fork`/`exec`/`exit` with real exit code) plus a file-access set
+//! covering `openat`, `openat2`, `renameat2`, `unlinkat`, and `truncate`. The
+//! kernel side stays deliberately thin: it filters nothing by policy (that is
+//! userspace scoping, `specs/observation.md` §8) and emits typed events on a
+//! single ring buffer.
+
 use aya_ebpf::{
     helpers::{
-        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_uid_gid,
-        bpf_ktime_get_ns, bpf_probe_read_kernel_str_bytes, bpf_probe_read_user_str_bytes,
+        bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_user,
+        bpf_probe_read_user_str_bytes,
     },
     macros::{map, tracepoint},
     maps::{LruHashMap, PerCpuArray, RingBuf},
     programs::TracePointContext,
-    EbpfContext,
 };
 
 use ci_tracer_common::*;
@@ -17,30 +25,39 @@ use ci_tracer_common::*;
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
 
-/// Tracks process start times for duration calculation on exit.
-#[map]
-static START_TIMES: LruHashMap<u32, u64> = LruHashMap::with_max_entries(10240, 0);
-
-/// Tracks child → parent PID relationships (populated by fork handler).
+/// child PID -> parent PID, populated by the fork handler.
 #[map]
 static PARENT_MAP: LruHashMap<u32, u32> = LruHashMap::with_max_entries(10240, 0);
 
-/// Per-CPU scratch buffer for exec events (avoids 512-byte BPF stack limit).
+/// tgid -> exit status, populated by `sys_enter_exit_group`, read on exit.
 #[map]
-static EXEC_BUF: PerCpuArray<ProcessExecEvent> = PerCpuArray::with_max_entries(1, 0);
+static EXIT_CODES: LruHashMap<u32, i32> = LruHashMap::with_max_entries(10240, 0);
 
-/// Per-CPU scratch buffer for file-open events.
+/// Per-CPU scratch for file-access events.
 #[map]
-static FILE_BUF: PerCpuArray<FileOpenEvent> = PerCpuArray::with_max_entries(1, 0);
+static FILE_BUF: PerCpuArray<FileAccessEvent> = PerCpuArray::with_max_entries(1, 0);
+
+// Open flags (Linux, x86_64).
+const O_WRONLY: u64 = 1;
+const O_RDWR: u64 = 2;
+const O_CREAT: u64 = 0o100;
+
+#[inline(always)]
+fn classify_open(flags: u64) -> u32 {
+    if flags & O_CREAT != 0 {
+        ACCESS_CREATE
+    } else if flags & (O_WRONLY | O_RDWR) != 0 {
+        ACCESS_WRITE
+    } else {
+        ACCESS_READ
+    }
+}
 
 // ---------------------------------------------------------------------------
-// sched_process_fork – records parent→child PID mapping
+// sched_process_fork - parent->child PID mapping
+//   offset 24: pid_t parent_pid (i32)
+//   offset 44: pid_t child_pid  (i32)
 // ---------------------------------------------------------------------------
-// Tracepoint format (x86_64):
-//   offset  8: char parent_comm[16]
-//   offset 24: pid_t parent_pid     (i32)
-//   offset 28: char child_comm[16]
-//   offset 44: pid_t child_pid      (i32)
 
 #[tracepoint]
 pub fn trace_fork(ctx: TracePointContext) -> u32 {
@@ -58,12 +75,10 @@ unsafe fn try_trace_fork(ctx: &TracePointContext) -> Result<(), i64> {
 }
 
 // ---------------------------------------------------------------------------
-// sched_process_exec – fires when a process calls execve()
+// sched_process_exec - execve()
+// We only need pid/ppid/comm; the exec filename is unused (the command is
+// resolved from /proc/<pid>/cmdline in userspace).
 // ---------------------------------------------------------------------------
-// Tracepoint format (x86_64):
-//   offset  8: __data_loc char[] filename  (u32)
-//   offset 12: pid_t pid                   (i32)
-//   offset 16: pid_t old_pid               (i32)
 
 #[tracepoint]
 pub fn trace_exec(ctx: TracePointContext) -> u32 {
@@ -73,54 +88,53 @@ pub fn trace_exec(ctx: TracePointContext) -> u32 {
     }
 }
 
-unsafe fn try_trace_exec(ctx: &TracePointContext) -> Result<(), i64> {
-    let ts = bpf_ktime_get_ns();
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let pid = pid_tgid as u32;
-    let tgid = (pid_tgid >> 32) as u32;
-
+unsafe fn try_trace_exec(_ctx: &TracePointContext) -> Result<(), i64> {
+    let pid = bpf_get_current_pid_tgid() as u32;
     if pid == 0 {
         return Ok(());
     }
 
-    let uid = bpf_get_current_uid_gid() as u32;
-
-    let ppid = match PARENT_MAP.get(&pid) {
-        Some(p) => *p,
-        None => 0,
+    let event = ProcessExecEvent {
+        event_type: EVENT_PROCESS_EXEC,
+        pid,
+        ppid: PARENT_MAP.get(&pid).copied().unwrap_or(0),
+        comm: bpf_get_current_comm()?,
     };
 
-    let _ = START_TIMES.insert(&pid, &ts, 0);
-
-    let buf = &mut *EXEC_BUF.get_ptr_mut(0).ok_or(0i64)?;
-    buf.event_type = EVENT_PROCESS_EXEC;
-    buf.pid = pid;
-    buf.ppid = ppid;
-    buf.tgid = tgid;
-    buf.uid = uid;
-    buf._pad = 0;
-    buf.timestamp_ns = ts;
-    buf.comm = bpf_get_current_comm().map_err(|e| e)?;
-
-    buf.filename[0] = 0;
-    let data_loc: u32 = ctx.read_at(8)?;
-    let offset = (data_loc & 0xFFFF) as usize;
-    let _ = bpf_probe_read_kernel_str_bytes(
-        ctx.as_ptr().add(offset) as *const u8,
-        &mut buf.filename,
-    );
-
-    EVENTS.output(buf, 0).map_err(|e| e)?;
+    EVENTS.output(&event, 0)?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// sched_process_exit – fires when a process terminates
+// sys_enter_exit_group - capture the process exit status
+//   offset 16: unsigned long error_code (args[0])
 // ---------------------------------------------------------------------------
-// Tracepoint format (sched_process_template, x86_64):
+
+#[tracepoint]
+pub fn trace_exit_group(ctx: TracePointContext) -> u32 {
+    match unsafe { try_trace_exit_group(&ctx) } {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+unsafe fn try_trace_exit_group(ctx: &TracePointContext) -> Result<(), i64> {
+    let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    if tgid == 0 {
+        return Ok(());
+    }
+    let raw: u64 = ctx.read_at(16)?;
+    // glibc passes the process exit status; the low byte is the exit code.
+    let code = (raw & 0xff) as i32;
+    let _ = EXIT_CODES.insert(&tgid, &code, 0);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// sched_process_exit - process termination
 //   offset  8: char comm[16]
-//   offset 24: pid_t pid      (i32)
-//   offset 28: int   prio     (i32)
+//   offset 24: pid_t pid (i32)
+// ---------------------------------------------------------------------------
 
 #[tracepoint]
 pub fn trace_exit(ctx: TracePointContext) -> u32 {
@@ -131,47 +145,57 @@ pub fn trace_exit(ctx: TracePointContext) -> u32 {
 }
 
 unsafe fn try_trace_exit(ctx: &TracePointContext) -> Result<(), i64> {
-    let ts = bpf_ktime_get_ns();
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = pid_tgid as u32;
+    let tgid = (pid_tgid >> 32) as u32;
 
     if pid == 0 {
         return Ok(());
     }
 
-    let duration_ns = match START_TIMES.get(&pid) {
-        Some(start) => {
-            let d = ts.saturating_sub(*start);
-            let _ = START_TIMES.remove(&pid);
-            d
+    let (exit_code, code_observed) = match EXIT_CODES.get(&tgid) {
+        Some(code) => {
+            let c = *code;
+            let _ = EXIT_CODES.remove(&tgid);
+            (c, 1)
         }
-        None => 0,
+        None => (0, 0),
     };
 
-    let mut event = ProcessExitEvent {
+    let event = ProcessExitEvent {
         event_type: EVENT_PROCESS_EXIT,
         pid,
-        timestamp_ns: ts,
-        duration_ns,
-        comm: [0u8; COMM_LEN],
+        exit_code,
+        code_observed,
+        comm: ctx.read_at(8).unwrap_or([0u8; COMM_LEN]),
     };
 
-    let comm: [u8; 16] = ctx.read_at(8).unwrap_or([0u8; 16]);
-    event.comm = comm;
-
-    EVENTS.output(&event, 0).map_err(|e| e)?;
+    EVENTS.output(&event, 0)?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// sys_enter_openat – fires on every openat() syscall
+// File-access helper
 // ---------------------------------------------------------------------------
-// Tracepoint format (x86_64, args stored as unsigned long):
-//   offset  8: long __syscall_nr
-//   offset 16: unsigned long dfd        (args[0])
-//   offset 24: unsigned long filename   (args[1], userspace pointer)
-//   offset 32: unsigned long flags      (args[2])
-//   offset 40: unsigned long mode       (args[3])
+
+#[inline(always)]
+unsafe fn emit_file_access(pid: u32, access: u32, user_path_ptr: u64) -> Result<(), i64> {
+    let buf = &mut *FILE_BUF.get_ptr_mut(0).ok_or(0i64)?;
+    buf.event_type = EVENT_FILE_ACCESS;
+    buf.pid = pid;
+    buf.access = access;
+    buf.comm = bpf_get_current_comm()?;
+    buf.filename[0] = 0;
+    let _ = bpf_probe_read_user_str_bytes(user_path_ptr as *const u8, &mut buf.filename);
+    EVENTS.output(buf, 0)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// sys_enter_openat
+//   offset 24: filename (args[1], user ptr)
+//   offset 32: flags    (args[2])
+// ---------------------------------------------------------------------------
 
 #[tracepoint]
 pub fn trace_openat(ctx: TracePointContext) -> u32 {
@@ -182,30 +206,110 @@ pub fn trace_openat(ctx: TracePointContext) -> u32 {
 }
 
 unsafe fn try_trace_openat(ctx: &TracePointContext) -> Result<(), i64> {
-    let ts = bpf_ktime_get_ns();
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let pid = pid_tgid as u32;
-
+    let pid = bpf_get_current_pid_tgid() as u32;
     if pid == 0 {
         return Ok(());
     }
-
     let filename_ptr: u64 = ctx.read_at(24)?;
     let flags: u64 = ctx.read_at(32)?;
+    emit_file_access(pid, classify_open(flags), filename_ptr)
+}
 
-    let buf = &mut *FILE_BUF.get_ptr_mut(0).ok_or(0i64)?;
-    buf.event_type = EVENT_FILE_OPEN;
-    buf.pid = pid;
-    buf.timestamp_ns = ts;
-    buf.flags = flags as u32;
-    buf._pad = 0;
-    buf.comm = bpf_get_current_comm().map_err(|e| e)?;
+// ---------------------------------------------------------------------------
+// sys_enter_openat2
+//   offset 24: filename       (args[1], user ptr)
+//   offset 32: struct open_how *how (args[2], user ptr); how->flags is u64 @ 0
+// ---------------------------------------------------------------------------
 
-    buf.filename[0] = 0;
-    let _ = bpf_probe_read_user_str_bytes(filename_ptr as *const u8, &mut buf.filename);
+#[tracepoint]
+pub fn trace_openat2(ctx: TracePointContext) -> u32 {
+    match unsafe { try_trace_openat2(&ctx) } {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
 
-    EVENTS.output(buf, 0).map_err(|e| e)?;
-    Ok(())
+unsafe fn try_trace_openat2(ctx: &TracePointContext) -> Result<(), i64> {
+    let pid = bpf_get_current_pid_tgid() as u32;
+    if pid == 0 {
+        return Ok(());
+    }
+    let filename_ptr: u64 = ctx.read_at(24)?;
+    let how_ptr: u64 = ctx.read_at(32)?;
+    let flags: u64 = bpf_probe_read_user(how_ptr as *const u64).unwrap_or(0);
+    emit_file_access(pid, classify_open(flags), filename_ptr)
+}
+
+// ---------------------------------------------------------------------------
+// sys_enter_renameat2 - output under a new path, old path removed
+//   offset 24: oldname (args[1], user ptr)
+//   offset 40: newname (args[3], user ptr)
+// ---------------------------------------------------------------------------
+
+#[tracepoint]
+pub fn trace_renameat2(ctx: TracePointContext) -> u32 {
+    match unsafe { try_trace_renameat2(&ctx) } {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+unsafe fn try_trace_renameat2(ctx: &TracePointContext) -> Result<(), i64> {
+    let pid = bpf_get_current_pid_tgid() as u32;
+    if pid == 0 {
+        return Ok(());
+    }
+    let oldname_ptr: u64 = ctx.read_at(24)?;
+    let newname_ptr: u64 = ctx.read_at(40)?;
+    let _ = emit_file_access(pid, ACCESS_DELETE, oldname_ptr);
+    emit_file_access(pid, ACCESS_CREATE, newname_ptr)
+}
+
+// ---------------------------------------------------------------------------
+// sys_enter_unlinkat - deletion
+//   offset 24: pathname (args[1], user ptr)
+// ---------------------------------------------------------------------------
+
+#[tracepoint]
+pub fn trace_unlinkat(ctx: TracePointContext) -> u32 {
+    match unsafe { try_trace_unlinkat(&ctx) } {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+unsafe fn try_trace_unlinkat(ctx: &TracePointContext) -> Result<(), i64> {
+    let pid = bpf_get_current_pid_tgid() as u32;
+    if pid == 0 {
+        return Ok(());
+    }
+    let pathname_ptr: u64 = ctx.read_at(24)?;
+    emit_file_access(pid, ACCESS_DELETE, pathname_ptr)
+}
+
+// ---------------------------------------------------------------------------
+// sys_enter_truncate - in-place output truncation
+//   offset 16: path (args[0], user ptr)
+//
+// `ftruncate` operates on a file descriptor with no path argument; resolving
+// fd -> path in-kernel is deferred (see specs/observation.md §3).
+// ---------------------------------------------------------------------------
+
+#[tracepoint]
+pub fn trace_truncate(ctx: TracePointContext) -> u32 {
+    match unsafe { try_trace_truncate(&ctx) } {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+unsafe fn try_trace_truncate(ctx: &TracePointContext) -> Result<(), i64> {
+    let pid = bpf_get_current_pid_tgid() as u32;
+    if pid == 0 {
+        return Ok(());
+    }
+    let path_ptr: u64 = ctx.read_at(16)?;
+    emit_file_access(pid, ACCESS_TRUNCATE, path_ptr)
 }
 
 #[panic_handler]

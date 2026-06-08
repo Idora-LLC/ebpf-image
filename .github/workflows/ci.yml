@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev build-essential pkg-config
+
+      - name: Install Rust (stable + nightly)
+        run: |
+          rustup toolchain install stable --component rustfmt clippy
+          rustup toolchain install nightly --component rust-src
+          cargo install bpf-linker --locked
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Build eBPF program
+        run: cargo xtask build-ebpf --profile release
+
+      - name: Clippy (userspace workspace)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --workspace
+
+  build:
+    name: build agent binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev build-essential pkg-config
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable
+          rustup toolchain install nightly --component rust-src
+          cargo install bpf-linker --locked
+
+      - name: Build eBPF + userspace
+        run: |
+          cargo xtask build-ebpf --profile release
+          cargo build --package ci-tracer --release
+
+      - name: Smoke-load the binary
+        run: |
+          sudo mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+          sudo mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true
+          sudo timeout 3 ./target/release/ci-tracer || true
+          echo "binary loaded"
+
+  e2e:
+    name: end-to-end (mock pipeline)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev build-essential pkg-config
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable
+          rustup toolchain install nightly --component rust-src
+          cargo install bpf-linker --locked
+
+      - name: Run E2E
+        run: |
+          sudo mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+          sudo mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true
+          bash scripts/e2e.sh

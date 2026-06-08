@@ -1,149 +1,104 @@
-use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
+//! The Idora Recorder agent: the privileged eBPF process started once per CI
+//! job. It loads the kernel programs, attaches the observation hook set, drains
+//! events into the userspace [`ci_tracer::observe::ProcessTree`], and at each
+//! operation boundary (and at shutdown) resolves -> hashes -> assembles ->
+//! submits, reconciling observed-vs-submitted at the end (fail-open).
+//!
+//! Lifecycle is bound to the Action's `pre`/`post` hooks (`specs/architecture.md`
+//! §6): `start.js` launches this under `sudo`; `stop.js` sends SIGTERM to
+//! trigger finalization.
+
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use aya::maps::RingBuf;
 use aya::programs::TracePoint;
 use aya::Ebpf;
-use chrono::Utc;
-use serde_json::json;
 use tokio::signal::unix::{signal, SignalKind};
 
-use ci_tracer_common::*;
-
-/// Commands we want to trace. Matched against the 16-byte `comm` field
-/// which npm sets via process.title (e.g. "npm run build").
-const WHITELIST: &[&str] = &["npm run build", "npm run test"];
-
-/// Info about a tracked process: which whitelisted root it belongs to.
-#[derive(Clone)]
-struct TrackedRoot {
-    root_pid: u32,
-    root_cmd: String,
-}
-
-struct ProcessTree {
-    /// PID → root info for all tracked processes.
-    tracked: HashMap<u32, TrackedRoot>,
-    /// PID → ppid from BPF fork events (for all processes, not just tracked).
-    parents: HashMap<u32, u32>,
-}
-
-impl ProcessTree {
-    fn new() -> Self {
-        Self {
-            tracked: HashMap::new(),
-            parents: HashMap::new(),
-        }
-    }
-
-    /// Record a parent→child relationship from BPF (called for every exec).
-    fn set_parent(&mut self, pid: u32, ppid: u32) {
-        if ppid != 0 {
-            self.parents.insert(pid, ppid);
-        }
-    }
-
-    /// Check if a process matches the whitelist or inherits from a tracked parent.
-    fn check_membership(&mut self, pid: u32, comm: &str) -> Option<TrackedRoot> {
-        if let Some(root) = self.tracked.get(&pid) {
-            return Some(root.clone());
-        }
-
-        // Check comm against whitelist.
-        for pattern in WHITELIST {
-            if comm_matches(comm, pattern) {
-                let root = TrackedRoot {
-                    root_pid: pid,
-                    root_cmd: comm.to_string(),
-                };
-                self.tracked.insert(pid, root.clone());
-                return Some(root);
-            }
-        }
-
-        // Walk up the parent chain looking for a tracked ancestor.
-        let mut cursor = pid;
-        for _ in 0..32 {
-            let ppid = match self.parents.get(&cursor) {
-                Some(&p) => p,
-                None => break,
-            };
-            if let Some(root) = self.tracked.get(&ppid).cloned() {
-                self.tracked.insert(pid, root.clone());
-                return Some(root);
-            }
-            cursor = ppid;
-        }
-
-        None
-    }
-
-    /// Remove a PID on exit.
-    fn remove(&mut self, pid: &u32) -> Option<TrackedRoot> {
-        self.parents.remove(pid);
-        self.tracked.remove(pid)
-    }
-}
-
-/// Match the kernel's 16-byte comm field against a whitelist pattern.
-fn comm_matches(comm: &str, pattern: &str) -> bool {
-    if pattern.len() <= COMM_LEN {
-        comm == pattern
-    } else {
-        comm == &pattern[..COMM_LEN]
-    }
-}
+use ci_tracer::adapter::github::GithubAdapter;
+use ci_tracer::assemble::assemble;
+use ci_tracer::config::Config;
+use ci_tracer::detect;
+use ci_tracer::events::{decode, Event};
+use ci_tracer::hash::Hasher;
+use ci_tracer::observe::{Operation, ProcessTree};
+use ci_tracer::reconcile::Reconciler;
+use ci_tracer::resolve::ProcFs;
+use ci_tracer::submit::{SubmitOutcome, Submitter};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN); }
+    // Ignore SIGPIPE so a closed log pipe never kills the agent.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
     bump_memlock_rlimit();
 
-    #[repr(C, align(8))]
-    struct Aligned<T: ?Sized>(T);
-    static BPF_OBJ: &Aligned<[u8]> = &Aligned(*include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../target/bpfel-unknown-none/release/ci-tracer-ebpf"
-    )));
+    let config = Config::from_env();
+    let reconciler = Reconciler::new(&config.state_dir);
+    reconciler.heartbeat_start();
 
-    let mut bpf = Ebpf::load(&BPF_OBJ.0)?;
-
-    attach_tracepoint(&mut bpf, "trace_fork", "sched", "sched_process_fork")?;
-    attach_tracepoint(&mut bpf, "trace_exec", "sched", "sched_process_exec")?;
-    attach_tracepoint(&mut bpf, "trace_exit", "sched", "sched_process_exit")?;
-    attach_tracepoint(&mut bpf, "trace_openat", "syscalls", "sys_enter_openat")?;
-
-    eprintln!("[ci-recorder] Tracer started, watching for: {:?}", WHITELIST);
-
-    let mut ring_buf = RingBuf::try_from(bpf.map_mut("EVENTS").unwrap())?;
-
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/var/log/ci-trace.jsonl")
-        .context("failed to open /var/log/ci-trace.jsonl")?;
-    let mut writer = BufWriter::new(file);
-
-    let workspace = std::env::var("GITHUB_WORKSPACE").unwrap_or_default();
-    if !workspace.is_empty() {
-        eprintln!("[ci-recorder] Workspace: {workspace}");
+    // No-eBPF handling (specs/deployment.md §4): no record, build not failed,
+    // gap reconciled as unknown. Hard-fail is opt-in.
+    if !detect::ebpf_available() {
+        eprintln!(
+            "[ci-recorder] {}: eBPF unavailable on this runner; no record will be produced",
+            ci_tracer::diag::OBS_001
+        );
+        reconciler.finish();
+        if config.hard_fail {
+            anyhow::bail!("eBPF unavailable and hard-fail is enabled");
+        }
+        return Ok(());
     }
 
-    let mut tree = ProcessTree::new();
-    let mut stats = Stats::default();
+    if let Err(e) = run(config, reconciler).await {
+        // Fail-open: surface the error but never propagate a non-zero exit that
+        // would fail the customer's CI step.
+        eprintln!("[ci-recorder] agent error (fail-open): {e:#}");
+    }
+    Ok(())
+}
+
+async fn run(config: Config, mut reconciler: Reconciler) -> Result<()> {
+    let mut bpf = load_bpf()?;
+    attach_all(&mut bpf)?;
+
+    let adapter = GithubAdapter::from_env(
+        config.type_hint,
+        config.deploy_target.clone(),
+        config.env_allowlist.clone(),
+    );
+    let submitter = match (&config.pipeline_url, &config.token) {
+        (Some(url), Some(token)) => Some(Submitter::new(url, token.clone())),
+        _ => {
+            eprintln!("[ci-recorder] no pipeline URL/token configured; records will be buffered only");
+            None
+        }
+    };
+
+    let proc = ProcFs;
+    let mut tree = ProcessTree::new(config.whitelist.clone());
+    let mut ring_buf = RingBuf::try_from(bpf.map_mut("EVENTS").context("EVENTS map missing")?)?;
+
+    eprintln!(
+        "[ci-recorder] started; observation_mode={}, hash_tier={}, whitelist={:?}",
+        ci_tracer::diag::OBSERVATION_MODE,
+        ci_tracer::hash::hash_tier(),
+        config.whitelist.iter().map(|e| &e.pattern).collect::<Vec<_>>()
+    );
+    if detect::bpf_lsm_available() {
+        eprintln!("[ci-recorder] BPF-LSM present; kernel-atomic hashing tier is available (self-hosted)");
+    }
+
     let mut sigterm = signal(SignalKind::terminate())?;
 
     loop {
-        let mut had_events = false;
         while let Some(item) = ring_buf.next() {
-            handle_event(&item, &mut writer, &mut tree, &mut stats, &workspace);
-            had_events = true;
-        }
-        if had_events {
-            let _ = writer.flush();
+            if let Some(op) = dispatch(&item, &mut tree, &proc) {
+                process_operation(op, &adapter, submitter.as_ref(), &mut reconciler);
+            }
         }
 
         tokio::select! {
@@ -153,222 +108,131 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Drain anything buffered in the ring after the stop signal.
     while let Some(item) = ring_buf.next() {
-        handle_event(&item, &mut writer, &mut tree, &mut stats, &workspace);
+        if let Some(op) = dispatch(&item, &mut tree, &proc) {
+            process_operation(op, &adapter, submitter.as_ref(), &mut reconciler);
+        }
     }
-    let _ = writer.flush();
 
-    eprintln!(
-        "[ci-recorder] --- Summary: {} processes, {} files read, {} files written ---",
-        stats.process_count, stats.files_read, stats.files_written
-    );
+    // Finalize operations whose root never exited before job end.
+    for op in tree.finalize_all() {
+        process_operation(op, &adapter, submitter.as_ref(), &mut reconciler);
+    }
 
+    // Last chance to resend buffered records before the workspace disappears.
+    if let Some(s) = submitter.as_ref() {
+        let _ = reconciler.flush_buffered(s);
+    }
+
+    reconciler.finish();
     Ok(())
 }
 
-fn attach_tracepoint(
-    bpf: &mut Ebpf,
-    prog_name: &str,
-    category: &str,
-    tp_name: &str,
-) -> Result<()> {
-    let prog: &mut TracePoint = bpf
-        .program_mut(prog_name)
-        .with_context(|| format!("program {prog_name} not found in BPF object"))?
-        .try_into()?;
-    prog.load()?;
-    prog.attach(category, tp_name)
-        .with_context(|| format!("failed to attach {category}/{tp_name}"))?;
+/// Decode one ring-buffer record and feed it to the process tree, returning a
+/// finalized operation when a root exits.
+fn dispatch(data: &[u8], tree: &mut ProcessTree, proc: &ProcFs) -> Option<Operation> {
+    match decode(data)? {
+        Event::Exec(e) => {
+            tree.on_exec(&e, proc);
+            None
+        }
+        Event::File(e) => {
+            tree.on_file(&e, proc);
+            None
+        }
+        Event::Exit(e) => tree.on_exit(&e, proc),
+    }
+}
+
+fn process_operation(
+    op: Operation,
+    adapter: &GithubAdapter,
+    submitter: Option<&Submitter>,
+    reconciler: &mut Reconciler,
+) {
+    reconciler.record_observed();
+
+    let repo_root = op.working_directory.clone().unwrap_or_default();
+    let hasher = Hasher::new(repo_root);
+    let env_vars: Vec<(String, String)> = std::env::vars().collect();
+
+    let body = match assemble(&op, adapter, &hasher, env_vars) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("[ci-recorder] assembly failed for op pid={}: {e:#}", op.root_pid);
+            return;
+        }
+    };
+
+    eprintln!(
+        "[ci-recorder] operation: type={} command={:?} inputs={} outputs={} exit={:?}",
+        body.run_record.run_type.as_str(),
+        body.run_record.command,
+        body.run_record.inputs.as_ref().map(|v| v.len()).unwrap_or(0),
+        body.run_record.outputs.as_ref().map(|v| v.len()).unwrap_or(0),
+        body.run_record.exit_code,
+    );
+
+    match submitter {
+        Some(s) => match s.submit(&body) {
+            SubmitOutcome::Success { receipt_id } => {
+                eprintln!("[ci-recorder] submitted -> {receipt_id}");
+                reconciler.record_submitted();
+            }
+            // Fail-open: buffer for retry; reconciliation surfaces the gap.
+            _ => reconciler.buffer(&body),
+        },
+        None => reconciler.buffer(&body),
+    }
+}
+
+fn load_bpf() -> Result<Ebpf> {
+    #[repr(C, align(8))]
+    struct Aligned<T: ?Sized>(T);
+    static BPF_OBJ: &Aligned<[u8]> = &Aligned(*include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../target/bpfel-unknown-none/release/ci-tracer-ebpf"
+    )));
+    Ebpf::load(&BPF_OBJ.0).context("loading BPF object")
+}
+
+fn attach_all(bpf: &mut Ebpf) -> Result<()> {
+    // Core set: required. Failure here is a genuine error.
+    attach(bpf, "trace_fork", "sched", "sched_process_fork", true)?;
+    attach(bpf, "trace_exec", "sched", "sched_process_exec", true)?;
+    attach(bpf, "trace_exit", "sched", "sched_process_exit", true)?;
+    attach(bpf, "trace_exit_group", "syscalls", "sys_enter_exit_group", true)?;
+    attach(bpf, "trace_openat", "syscalls", "sys_enter_openat", true)?;
+
+    // Broadened set: best-effort, so older kernels still run with core coverage.
+    attach(bpf, "trace_openat2", "syscalls", "sys_enter_openat2", false)?;
+    attach(bpf, "trace_renameat2", "syscalls", "sys_enter_renameat2", false)?;
+    attach(bpf, "trace_unlinkat", "syscalls", "sys_enter_unlinkat", false)?;
+    attach(bpf, "trace_truncate", "syscalls", "sys_enter_truncate", false)?;
     Ok(())
 }
 
-// ── Event handling ──────────────────────────────────────────────────────────
+fn attach(bpf: &mut Ebpf, prog: &str, category: &str, name: &str, required: bool) -> Result<()> {
+    let result = (|| -> Result<()> {
+        let p: &mut TracePoint = bpf
+            .program_mut(prog)
+            .with_context(|| format!("program {prog} not found"))?
+            .try_into()?;
+        p.load()?;
+        p.attach(category, name)
+            .with_context(|| format!("attach {category}/{name}"))?;
+        Ok(())
+    })();
 
-#[derive(Default)]
-struct Stats {
-    process_count: u64,
-    files_read: u64,
-    files_written: u64,
-}
-
-fn handle_event(
-    data: &[u8],
-    writer: &mut BufWriter<std::fs::File>,
-    tree: &mut ProcessTree,
-    stats: &mut Stats,
-    workspace: &str,
-) {
-    if data.len() < 4 {
-        return;
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if !required => {
+            eprintln!("[ci-recorder] optional hook {category}/{name} unavailable: {e}");
+            Ok(())
+        }
+        Err(e) => Err(e),
     }
-
-    let event_type = u32::from_ne_bytes(data[0..4].try_into().unwrap());
-
-    match event_type {
-        EVENT_PROCESS_EXEC => handle_exec(data, writer, tree, stats),
-        EVENT_PROCESS_EXIT => handle_exit(data, writer, tree, stats),
-        EVENT_FILE_OPEN => handle_file_open(data, writer, tree, stats, workspace),
-        _ => {}
-    }
-}
-
-fn handle_exec(
-    data: &[u8],
-    writer: &mut BufWriter<std::fs::File>,
-    tree: &mut ProcessTree,
-    stats: &mut Stats,
-) {
-    if data.len() < std::mem::size_of::<ProcessExecEvent>() {
-        return;
-    }
-    let event: &ProcessExecEvent = unsafe { &*(data.as_ptr() as *const ProcessExecEvent) };
-    let comm = bytes_to_str(&event.comm);
-    let filename = bytes_to_str(&event.filename);
-
-    tree.set_parent(event.pid, event.ppid);
-
-    let Some(root) = tree.check_membership(event.pid, comm) else {
-        return;
-    };
-
-    stats.process_count += 1;
-
-    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let j = json!({
-        "ts": now,
-        "event": "exec",
-        "pid": event.pid,
-        "ppid": event.ppid,
-        "comm": comm,
-        "filename": filename,
-        "root_pid": root.root_pid,
-        "root_cmd": root.root_cmd,
-    });
-    let _ = writeln!(writer, "{j}");
-
-    eprintln!(
-        "[ci-recorder] EXEC  pid={:<6} ppid={:<6} {:<16} {} (root: {})",
-        event.pid, event.ppid, comm, filename, root.root_cmd
-    );
-}
-
-fn handle_exit(
-    data: &[u8],
-    writer: &mut BufWriter<std::fs::File>,
-    tree: &mut ProcessTree,
-    stats: &mut Stats,
-) {
-    if data.len() < std::mem::size_of::<ProcessExitEvent>() {
-        return;
-    }
-    let event: &ProcessExitEvent = unsafe { &*(data.as_ptr() as *const ProcessExitEvent) };
-    let comm = bytes_to_str(&event.comm);
-
-    // Check comm in case we haven't seen the exec (npm sets title later).
-    let _ = tree.check_membership(event.pid, comm);
-
-    let Some(root) = tree.remove(&event.pid) else {
-        return;
-    };
-
-    let duration_s = event.duration_ns as f64 / 1_000_000_000.0;
-
-    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let j = json!({
-        "ts": now,
-        "event": "exit",
-        "pid": event.pid,
-        "comm": comm,
-        "duration_ms": event.duration_ns / 1_000_000,
-        "root_pid": root.root_pid,
-        "root_cmd": root.root_cmd,
-    });
-    let _ = writeln!(writer, "{j}");
-
-    eprintln!(
-        "[ci-recorder] EXIT  pid={:<6} {:<16} duration={:.3}s (root: {})",
-        event.pid, comm, duration_s, root.root_cmd
-    );
-}
-
-fn handle_file_open(
-    data: &[u8],
-    writer: &mut BufWriter<std::fs::File>,
-    tree: &mut ProcessTree,
-    stats: &mut Stats,
-    workspace: &str,
-) {
-    if data.len() < std::mem::size_of::<FileOpenEvent>() {
-        return;
-    }
-    let event: &FileOpenEvent = unsafe { &*(data.as_ptr() as *const FileOpenEvent) };
-    let comm = bytes_to_str(&event.comm);
-    let filename = bytes_to_str(&event.filename);
-
-    // Check comm — npm sets process.title to "npm run build" AFTER exec,
-    // so the first match often comes from a file-open event.
-    let Some(root) = tree.check_membership(event.pid, comm) else {
-        return;
-    };
-
-    if is_skip_path(filename, workspace) {
-        return;
-    }
-
-    let access = classify_access(event.flags);
-
-    match access {
-        "read" => stats.files_read += 1,
-        _ => stats.files_written += 1,
-    }
-
-    let root = root.clone();
-
-    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let j = json!({
-        "ts": now,
-        "event": "open",
-        "pid": event.pid,
-        "comm": comm,
-        "path": filename,
-        "access": access,
-        "root_pid": root.root_pid,
-        "root_cmd": root.root_cmd,
-    });
-    let _ = writeln!(writer, "{j}");
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────────────
-
-fn bytes_to_str(bytes: &[u8]) -> &str {
-    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    std::str::from_utf8(&bytes[..len]).unwrap_or("<invalid utf8>")
-}
-
-const O_WRONLY: u32 = 1;
-const O_RDWR: u32 = 2;
-const O_CREAT: u32 = 0o100;
-
-fn classify_access(flags: u32) -> &'static str {
-    if flags & O_CREAT != 0 {
-        "create"
-    } else if flags & (O_WRONLY | O_RDWR) != 0 {
-        "write"
-    } else {
-        "read"
-    }
-}
-
-/// Only keep files inside the workspace directory. Drops system libs,
-/// locale files, shared objects, /etc, /tmp, and node_modules.
-fn is_skip_path(path: &str, workspace: &str) -> bool {
-    if !path.starts_with('/') {
-        return true;
-    }
-    if !workspace.is_empty() && !path.starts_with(workspace) {
-        return true;
-    }
-    path.contains("/node_modules/")
 }
 
 fn bump_memlock_rlimit() {
@@ -376,6 +240,7 @@ fn bump_memlock_rlimit() {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
     };
+    // SAFETY: setrlimit with a valid resource and rlimit pointer.
     unsafe {
         libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim);
     }
