@@ -145,40 +145,6 @@ flowchart TB
 - Sensitive to kernel version and available hooks; an `openat`only PoC misses I/O paths (Riker’s “model the whole filesystem” lesson [2]).
 - The binary must be **pinned and checksum-verified** in the action for supply-chain hygiene.
 
-### Approach B — Owning / wrapping the CI image (Recorder as entrypoint)
-
-Idora ships container images with the Recorder baked in as the **entrypoint (PID 1)**, so it supervises the operations running inside the container.
-
-```mermaid
-flowchart TB
-  img["Idora-owned image (Recorder as ENTRYPOINT / PID 1)"] --> spawn["Recorder launches the real build/test/deploy command"]
-  spawn --> obs["Recorder supervises child processes + file I/O"]
-  obs --> rr["assemble execution RunRecord"]
-  rr --> post["POST /pipeline/process"]
-```
-
-**Tradeoffs:**
-
-| Lens | Assessment |
-| --- | --- |
-| Adoption | **High friction** — the customer must switch their CI/base image to an Idora-derived image (or let Idora wrap theirs). Most teams have an existing, carefully chosen base image; forcing a swap is a large ask. |
-| Trust / control | Gives Idora **maximum control and visibility** — it owns the whole runtime. This is the strongest “control over their internals” position, but also the **hardest trust sell for a startup**, because the customer is handing their entire build runtime to a third party. |
-| Coverage | Very high — full supervision of the process tree from PID 1. |
-| Idora burden | **Heavy and ongoing** (see below). |
-| Portability | Low — image-based, so it does not help typical host-based hosted-runner jobs at all. |
-
-> **Decisive finding: on GitHub Actions, the entrypoint is not yours to own.** When a job uses `container:`, GitHub **overrides the image’s `ENTRYPOINT`/`CMD`** — it starts the container with its own command (effectively `--entrypoint tail … -f /dev/null` to keep it alive) and then runs **every step via `docker exec`** [13][14]. A Recorder baked in as the image `ENTRYPOINT` is therefore **silently ignored** for job containers. The image `ENTRYPOINT` is only honored for Docker **container *actions*** (`uses: docker://…`), and even then an action’s metadata `entrypoint` overrides the Dockerfile [15]. So the core mechanism of Approach B does not function on the primary target (GitHub Actions job containers); it would only work via self-hosted runner container-customization hooks or by reframing the Recorder as a container action that wraps a single command.
-> 
-
-**Implications / risks to call out (research-grounded):**
-
-- **The entrypoint override above** largely invalidates “Recorder as PID 1” on hosted GitHub Actions; this is a hard technical blocker, not just friction.
-- **PID 1 responsibilities.** Even where the Recorder *can* be the entrypoint, becoming PID 1 means inheriting init duties — **signal forwarding** and **zombie reaping** — which non-init processes do not do correctly and which tools like `tini`/`dumb-init` exist specifically to handle [16][17]. A correct wrapper across arbitrary images must replicate this, or risk hung shutdowns and PID exhaustion.
-- **Overwriting someone else’s `ENTRYPOINT`** — risk of breaking the customer’s existing init/entrypoint behavior; the Recorder must correctly chain to the original command.
-- **Becoming a wrapper on top of hundreds of the most-used base images** — a combinatorial maintenance problem.
-- **Heavy infra in the future** — needing to build an Idora image variant on top of essentially *every* image used across customers’ CI is a large, ongoing build/release pipeline burden for a startup.
-- **Limited applicability** — only meaningfully applies to self-hosted runners / container *actions*; it does nothing for the common case of host-based hosted-runner jobs, and (per the override above) nothing for `container:` job containers either.
-
 ### Approach C — Non-eBPF / hybrid fallbacks (brief)
 
 Included to show the full tradeoff space, not as a primary contender:
@@ -200,11 +166,11 @@ flowchart LR
 
 ### Closing comparison + recommendation
 
-- **Adoption** strongly favors **Approach A** (one step, zero infra change). Approach B is not merely high-friction — on the primary target (GitHub Actions `container:` jobs) its core entrypoint mechanism is **overridden by GitHub and does not run at all** [13][14]. Approach C is a fallback only.
-- **Control / visibility** favors **Approach B** in principle, but the GitHub entrypoint override, the PID 1 init burden, and the per-image maintenance cost make that control largely unattainable on hosted CI and hard for a startup to justify.
-- **Capability parity is closer than it looks:** because eBPF in Approach A is kernel-global, it already sees the full process tree and file I/O without owning the runtime — so Approach B’s main theoretical advantage (total visibility) is mostly matched by A on standard runners.
+- **Adoption** strongly favors **Approach A** (one step, zero infra change). Approach C is a fallback only.
+- **Coverage:** because eBPF in Approach A is kernel-global, it already sees the full process tree and file I/O without owning the runtime — total visibility on standard runners, with no image to maintain.
+- **Trust / control:** Approach A presents the smallest, most auditable, and most removable footprint (one CI step) — the right posture for a trust vendor.
 
-**Recommendation:** lead with **Approach A** (external eBPF job) as the **default** — it minimizes customer effort, presents the smallest, most auditable trust surface, is already proven by production eBPF actions [7][8][9], and avoids the GitHub entrypoint-override and PID 1 pitfalls of Approach B. Keep an **owned-image / container-action path (Approach B)** only as an **optional offering** for self-hosted/enterprise customers who explicitly want it and control their runners. Treat **Approach C** as a **portability/fallback layer** for constrained runners (e.g. `ubuntu-slim`, older kernels) and as a hybrid complement to A.
+**Recommendation:** lead with **Approach A** (external eBPF job) as the **default** — it minimizes customer effort, presents the smallest, most auditable trust surface, is already proven by production eBPF actions [7][8][9], and requires no change to the customer's image or entrypoint. Treat **Approach C** as a **portability/fallback layer** for constrained runners (e.g. `ubuntu-slim`, older kernels) and as a hybrid complement to A.
 
 ## Research foundations and prior methods
 
@@ -230,11 +196,6 @@ The Recorder is not a green-field idea — capturing exactly which files an oper
 10. Cilium. “Tetragon — eBPF-based Security Observability” (CNCF). https://tetragon.io/
 11. “What if CI/CD pipelines had built-in security and observability with eBPF?” — BPF-LSM not enabled on hosted GitHub runners (needs GRUB change + reboot). https://ebpfchirp.substack.com/p/what-if-cicd-pipelines-had-built
 12. GitHub Docs. “GitHub-hosted runners reference” — `ubuntu-slim` runs steps in an unprivileged container (no low-level kernel features). https://docs.github.com/en/actions/reference/runners/github-hosted-runners
-13. GitHub Docs. “Running jobs in a container” — GitHub overrides the container `ENTRYPOINT`/`CMD` and runs steps via `docker exec`. https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/run-jobs-in-a-container
-14. Stack Overflow. “GitHub Actions ignores/overrides Docker container’s entrypoint” (container created with `-entrypoint tail`). https://stackoverflow.com/questions/66358482/github-actions-ignores-overrides-docker-containers-entrypoint
-15. GitHub Docs. “Dockerfile support for GitHub Actions” — action metadata `entrypoint` overrides the Dockerfile `ENTRYPOINT`. https://docs.github.com/en/actions/reference/workflows-and-actions/dockerfile-support
-16. krallin. “tini” — minimal init for containers (signal forwarding + zombie reaping; must run as PID 1 or as a subreaper). https://github.com/krallin/tini
-17. Yelp. “dumb-init” — PID 1 init for containers (signal handling, reaping orphaned zombies). https://github.com/Yelp/dumb-init
 
 [](https://app.notion.com/p/3746122559bb80188b8ac32e046a364d?pvs=21)
 

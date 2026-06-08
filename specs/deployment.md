@@ -1,10 +1,10 @@
 # Recorder - Deployment
 
-This spec defines how the Recorder is delivered into a customer's CI and how it behaves across runner types. The committed delivery model is **Approach A**: an external eBPF agent started by a single composite GitHub Action step, with no change to the customer's image or entrypoint. It covers the Action lifecycle (pre/main/post), the binary pull + checksum-verify, the runner compatibility matrix, the degraded-mode detection and fallback for runners without eBPF, and the optional owned-image (Approach B) and non-eBPF (Approach C) paths reserved for self-hosted/constrained environments. The tradeoff analysis behind these choices is in [recorder-proposal](../docs/recorder-proposal.md) §4-5; this spec is the operational contract. Resolves the runner-detection/fallback half of #7.
+This spec defines how the Recorder is delivered into a customer's CI and how it behaves across runner types. The committed delivery model is **Approach A**: an external eBPF agent started by a single composite GitHub Action step, with no change to the customer's image or entrypoint. It covers the Action lifecycle (pre/main/post), the binary pull + checksum-verify, the runner compatibility matrix, the degraded-mode detection and fallback for runners without eBPF, and the optional non-eBPF (Approach C) path reserved for constrained environments. The tradeoff analysis behind these choices is in [recorder-proposal](../docs/recorder-proposal.md) §4-5; this spec is the operational contract. Resolves the runner-detection/fallback half of #7.
 
 **Status**: Draft
 
-**Codebase mapping**: `action/` (`action.yml`, `start.js`, `noop.js`, `stop.js`), `Dockerfile`, release tooling
+**Codebase mapping**: `action/` (`action.yml`, `start.js`, `noop.js`, `stop.js`), release tooling
 
 **Related specs**: [architecture](architecture.md), [observation](observation.md), [content-hashing](content-hashing.md), [security](security.md), [recorder-proposal](../docs/recorder-proposal.md)
 
@@ -19,7 +19,7 @@ The Recorder ships as a **composite GitHub Action** that drops a privileged stat
   uses: Idora-LLC/ebpf-image@<pinned>
 ```
 
-This is the recommended default (lowest adoption friction, narrowest/most-removable trust surface; see [recorder-proposal](../docs/recorder-proposal.md) §5). Owned-image and non-eBPF paths are Sections 5-6.
+This is the recommended default (lowest adoption friction, narrowest/most-removable trust surface; see [recorder-proposal](../docs/recorder-proposal.md) §5). The non-eBPF fallback path is Section 5.
 
 ---
 
@@ -67,19 +67,13 @@ The inputs-blind `snapshot` fallback is **dropped**: an outputs-only record cann
 
 ---
 
-## 5. Optional: Owned Image / Container Action (Approach B)
-
-Reserved for self-hosted/enterprise customers who control their runners and explicitly want it. Not the default, because on GitHub Actions `container:` jobs the image `ENTRYPOINT` is overridden by GitHub (the Recorder-as-PID-1 mechanism does not run; see [recorder-proposal](../docs/recorder-proposal.md) §4-B). Where it applies, the Recorder is delivered via self-hosted runner container-customization hooks or as a container action wrapping a single command, and must handle PID 1 init duties (signal forwarding, zombie reaping) if it ever is PID 1.
-
----
-
-## 6. Optional: Non-eBPF Fallbacks (Approach C)
+## 5. Optional: Non-eBPF Fallbacks (Approach C)
 
 A possible future portability layer for constrained runners (older kernels, `ubuntu-slim`) where eBPF is unavailable. Only **input-capable** mechanisms are candidates, because an outputs-only capture has no proof value (the reason `snapshot` is dropped — see [observation](observation.md) §10): fanotify (file events, still needs `CAP_SYS_ADMIN` plus a separate exec-capture path) or — only when wrapping a single command — ptrace. None is implemented today; until one exists, no-eBPF runners produce no record (Section 4). Mechanism detail is deferred; the role is fallback, not primary.
 
 ---
 
-## 7. Release & Pinning
+## 6. Release & Pinning
 
 | Control | Decision |
 |---------|----------|

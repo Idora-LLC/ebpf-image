@@ -9,7 +9,6 @@ const os = require('os');
 
 const stateDir = process.env.RUNNER_TEMP || os.tmpdir();
 const pidPath = path.join(stateDir, 'ci-recorder.pid');
-const logPath = path.join(stateDir, 'ci-recorder.log');
 const signalPath = path.join(stateDir, 'ci-recorder-reconciliation.json');
 
 async function run() {
@@ -24,9 +23,9 @@ async function run() {
       console.log('[ci-recorder] no agent pid found (recorder may not have started)');
     }
 
-    if (fs.existsSync(logPath)) {
-      try { execSync(`sudo chmod 644 ${logPath} 2>/dev/null || true`); } catch {}
-    }
+    // The agent runs as root, so make its outputs (log, reconciliation signal,
+    // debug records JSONL, buffer) readable by the runner user for artifact upload.
+    try { execSync(`sudo chmod -R a+rX ${stateDir}/ci-recorder-* 2>/dev/null || true`); } catch {}
 
     // Surface the reconciliation result so a gap reads as unknown, not clean.
     if (fs.existsSync(signalPath)) {

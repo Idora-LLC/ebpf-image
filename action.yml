@@ -27,6 +27,10 @@ inputs:
     description: 'Fail the build when eBPF is unavailable instead of no-op (default: no-op, reconciled as unknown).'
     required: false
     default: 'false'
+  debug:
+    description: 'Write every produced RunRecord to $RUNNER_TEMP/ci-recorder-records.jsonl (for artifact upload), regardless of submission.'
+    required: false
+    default: 'false'
   version:
     description: 'Release tag of the recorder binary to download. Defaults to the action ref.'
     required: false

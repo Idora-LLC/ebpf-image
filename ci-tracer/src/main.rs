@@ -8,6 +8,8 @@
 //! §6): `start.js` launches this under `sudo`; `stop.js` sends SIGTERM to
 //! trigger finalization.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -78,6 +80,15 @@ async fn run(config: Config, mut reconciler: Reconciler) -> Result<()> {
         }
     };
 
+    // Debug mode: also dump every assembled RunRecord to a JSONL file so CI can
+    // upload it as an artifact, independent of submission.
+    let debug_records: Option<PathBuf> = config
+        .debug
+        .then(|| Path::new(&config.state_dir).join("ci-recorder-records.jsonl"));
+    if let Some(p) = &debug_records {
+        eprintln!("[ci-recorder] debug mode on; writing all RunRecords to {}", p.display());
+    }
+
     let proc = ProcFs;
     let mut tree = ProcessTree::new(config.whitelist.clone());
     let mut ring_buf = RingBuf::try_from(bpf.map_mut("EVENTS").context("EVENTS map missing")?)?;
@@ -97,7 +108,7 @@ async fn run(config: Config, mut reconciler: Reconciler) -> Result<()> {
     loop {
         while let Some(item) = ring_buf.next() {
             if let Some(op) = dispatch(&item, &mut tree, &proc) {
-                process_operation(op, &adapter, submitter.as_ref(), &mut reconciler);
+                process_operation(op, &adapter, submitter.as_ref(), debug_records.as_deref(), &mut reconciler);
             }
         }
 
@@ -111,13 +122,13 @@ async fn run(config: Config, mut reconciler: Reconciler) -> Result<()> {
     // Drain anything buffered in the ring after the stop signal.
     while let Some(item) = ring_buf.next() {
         if let Some(op) = dispatch(&item, &mut tree, &proc) {
-            process_operation(op, &adapter, submitter.as_ref(), &mut reconciler);
+            process_operation(op, &adapter, submitter.as_ref(), debug_records.as_deref(), &mut reconciler);
         }
     }
 
     // Finalize operations whose root never exited before job end.
     for op in tree.finalize_all() {
-        process_operation(op, &adapter, submitter.as_ref(), &mut reconciler);
+        process_operation(op, &adapter, submitter.as_ref(), debug_records.as_deref(), &mut reconciler);
     }
 
     // Last chance to resend buffered records before the workspace disappears.
@@ -149,6 +160,7 @@ fn process_operation(
     op: Operation,
     adapter: &GithubAdapter,
     submitter: Option<&Submitter>,
+    debug_records: Option<&Path>,
     reconciler: &mut Reconciler,
 ) {
     reconciler.record_observed();
@@ -174,6 +186,12 @@ fn process_operation(
         body.run_record.exit_code,
     );
 
+    if let Some(path) = debug_records {
+        if let Err(e) = append_debug_record(path, &body) {
+            eprintln!("[ci-recorder] failed to write debug record: {e}");
+        }
+    }
+
     match submitter {
         Some(s) => match s.submit(&body) {
             SubmitOutcome::Success { receipt_id } => {
@@ -185,6 +203,18 @@ fn process_operation(
         },
         None => reconciler.buffer(&body),
     }
+}
+
+/// Append one assembled submission to the debug JSONL file.
+fn append_debug_record(path: &Path, body: &ci_tracer::runrecord::SubmissionBody) -> Result<()> {
+    let mut line = serde_json::to_string(body)?;
+    line.push('\n');
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    f.write_all(line.as_bytes())?;
+    Ok(())
 }
 
 fn load_bpf() -> Result<Ebpf> {

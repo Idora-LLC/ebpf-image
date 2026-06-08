@@ -23,6 +23,9 @@ pub struct Config {
     pub env_allowlist: Vec<String>,
     /// If true, the build is failed when eBPF is unavailable (opt-in).
     pub hard_fail: bool,
+    /// If true, every assembled RunRecord is also written to a JSONL file in
+    /// `state_dir` (for artifact upload), regardless of submission.
+    pub debug: bool,
     /// Writable per-job state directory for buffering + signals.
     pub state_dir: String,
 }
@@ -41,9 +44,8 @@ impl Config {
             env_allowlist: input("ENV_ALLOWLIST")
                 .map(|s| parse_csv(&s))
                 .unwrap_or_default(),
-            hard_fail: input("HARD_FAIL")
-                .map(|s| matches!(s.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
-                .unwrap_or(false),
+            hard_fail: bool_input("HARD_FAIL"),
+            debug: bool_input("DEBUG"),
             state_dir: std::env::var("RUNNER_TEMP")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -57,6 +59,13 @@ fn input(name: &str) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Parse a boolean action input (`true`/`1`/`yes`), defaulting to false.
+fn bool_input(name: &str) -> bool {
+    input(name)
+        .map(|s| matches!(s.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
 }
 
 /// Parse a `type` string into the execution variant.

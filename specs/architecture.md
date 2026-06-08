@@ -73,7 +73,7 @@ The dividing line is the [ci-adapter](ci-adapter.md) contract: the core depends 
 
 The Recorder ships as **Approach A: an external eBPF agent launched by a single CI step** (the recommendation in [recorder-proposal](../docs/recorder-proposal.md) §5). On GitHub Actions this is a composite Action that drops a privileged static binary onto the runner and starts it before the build/test/deploy steps. No customer image change, no entrypoint change.
 
-The owned-image / container-action path (Approach B) and the non-eBPF fallbacks (Approach C) are optional/fallback delivery vehicles only, for self-hosted/constrained runners. The full delivery contract, runner compatibility matrix, and fallback wiring are in [deployment](deployment.md).
+The non-eBPF fallbacks (Approach C) are an optional fallback delivery vehicle only, for constrained runners. The full delivery contract, runner compatibility matrix, and fallback wiring are in [deployment](deployment.md).
 
 ---
 
