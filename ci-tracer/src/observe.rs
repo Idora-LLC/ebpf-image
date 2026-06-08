@@ -164,6 +164,7 @@ pub struct ProcessTree {
     dbg_unattributed: u64,
     dbg_unattr_samples: Vec<String>,
     dbg_attr_samples: Vec<String>,
+    dbg_exec_samples: Vec<String>,
     // #endregion
 }
 
@@ -180,18 +181,47 @@ impl ProcessTree {
             dbg_unattributed: 0,
             dbg_unattr_samples: Vec::new(),
             dbg_attr_samples: Vec::new(),
+            dbg_exec_samples: Vec::new(),
             // #endregion
         }
     }
 
     // #region agent log
+    /// Whether a path is part of the (e2e) repo build I/O rather than system noise.
+    fn dbg_interesting(path: &str) -> bool {
+        !path.starts_with('/') || path.contains("/repo/")
+    }
+
+    /// Walk the parent chain for `pid`, marking which entries are tracked,
+    /// so we can see exactly where attribution breaks.
+    fn dbg_chain(&self, pid: u32) -> String {
+        let mut out = String::new();
+        let mut cursor = pid;
+        for _ in 0..16 {
+            let t = if self.tracked.contains_key(&cursor) { "T" } else { "-" };
+            out.push_str(&format!("{cursor}{t} "));
+            match self.parents.get(&cursor) {
+                Some(&p) => cursor = p,
+                None => {
+                    out.push_str("|noparent");
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     /// Emit a one-shot attribution summary (debug session 5d16d6) to stderr,
     /// which is captured in the CI job log.
     pub fn debug_summary(&self) {
         eprintln!(
-            "[dbg 5d16d6 HYP=BCD] file_events_total={} attributed={} unattributed={}",
-            self.dbg_file_total, self.dbg_attributed, self.dbg_unattributed
+            "[dbg 5d16d6 HYP=BCD] file_events_total={} attributed={} unattributed={} parents_map={} tracked_map={}",
+            self.dbg_file_total, self.dbg_attributed, self.dbg_unattributed,
+            self.parents.len(), self.tracked.len()
         );
+        for s in &self.dbg_exec_samples {
+            eprintln!("[dbg 5d16d6 HYP=BC exec] {s}");
+        }
         for s in &self.dbg_attr_samples {
             eprintln!("[dbg 5d16d6 HYP=AE attr_sample] {s}");
         }
@@ -275,6 +305,16 @@ impl ProcessTree {
 
     pub fn on_exec(&mut self, e: &ExecEvent, proc: &dyn ProcSource) {
         self.set_parent(e.pid, e.ppid);
+        // #region agent log
+        if matches!(
+            e.comm.as_str(),
+            "sh" | "bash" | "dash" | "cat" | "mkdir" | "node" | "nest" | "tsc" | "npm run build"
+        ) && self.dbg_exec_samples.len() < 40
+        {
+            self.dbg_exec_samples
+                .push(format!("pid={} ppid={} comm={}", e.pid, e.ppid, e.comm));
+        }
+        // #endregion
         self.membership(e.pid, &e.comm, proc);
         // Late cwd/command capture if the root was created from a non-root comm.
         self.refresh_root_proc(e.pid, proc);
@@ -287,16 +327,19 @@ impl ProcessTree {
         let Some(root_pid) = self.membership(e.pid, &e.comm, proc) else {
             // #region agent log
             self.dbg_unattributed += 1;
-            if self.dbg_unattr_samples.len() < 15 {
-                self.dbg_unattr_samples
-                    .push(format!("pid={} comm={} {:?}:{}", e.pid, e.comm, e.access, e.path));
+            if Self::dbg_interesting(&e.path) && self.dbg_unattr_samples.len() < 25 {
+                let chain = self.dbg_chain(e.pid);
+                self.dbg_unattr_samples.push(format!(
+                    "pid={} comm={} {:?}:{} chain=[{}]",
+                    e.pid, e.comm, e.access, e.path, chain
+                ));
             }
             // #endregion
             return;
         };
         // #region agent log
         self.dbg_attributed += 1;
-        if self.dbg_attr_samples.len() < 15 {
+        if Self::dbg_interesting(&e.path) && self.dbg_attr_samples.len() < 25 {
             self.dbg_attr_samples
                 .push(format!("pid={} comm={} {:?}:{}", e.pid, e.comm, e.access, e.path));
         }
