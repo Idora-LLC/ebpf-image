@@ -155,7 +155,7 @@ async fn run(config: Config, mut reconciler: Reconciler) -> Result<()> {
     if let Some(m) = bpf.map("FORK_PROBE") {
         if let Ok(arr) = aya::maps::Array::<_, u32>::try_from(m) {
             let labels = [
-                "off16", "off20", "off24", "off28", "off32", "off36", "off40", "off44",
+                "off4", "off8", "off12", "off16", "off20", "off44", "off48", "off52",
                 "cur_tgid", "cur_pid",
             ];
             for (i, label) in labels.iter().enumerate() {

@@ -88,14 +88,14 @@ unsafe fn try_trace_fork(ctx: &TracePointContext) -> Result<(), i64> {
     if let Some(done) = FORK_PROBE.get_ptr_mut(15) {
         if *done == 0 {
             *done = 1;
-            store_probe(0, ctx.read_at::<u32>(16).unwrap_or(0));
-            store_probe(1, ctx.read_at::<u32>(20).unwrap_or(0));
-            store_probe(2, ctx.read_at::<u32>(24).unwrap_or(0));
-            store_probe(3, ctx.read_at::<u32>(28).unwrap_or(0));
-            store_probe(4, ctx.read_at::<u32>(32).unwrap_or(0));
-            store_probe(5, ctx.read_at::<u32>(36).unwrap_or(0));
-            store_probe(6, ctx.read_at::<u32>(40).unwrap_or(0));
-            store_probe(7, ctx.read_at::<u32>(44).unwrap_or(0));
+            store_probe(0, ctx.read_at::<u32>(4).unwrap_or(0));
+            store_probe(1, ctx.read_at::<u32>(8).unwrap_or(0));
+            store_probe(2, ctx.read_at::<u32>(12).unwrap_or(0));
+            store_probe(3, ctx.read_at::<u32>(16).unwrap_or(0));
+            store_probe(4, ctx.read_at::<u32>(20).unwrap_or(0));
+            store_probe(5, ctx.read_at::<u32>(44).unwrap_or(0));
+            store_probe(6, ctx.read_at::<u32>(48).unwrap_or(0));
+            store_probe(7, ctx.read_at::<u32>(52).unwrap_or(0));
             let pt = bpf_get_current_pid_tgid();
             store_probe(8, (pt >> 32) as u32);
             store_probe(9, pt as u32);
